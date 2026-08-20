@@ -24,7 +24,8 @@ GitHub Actions variables:
 
 The macOS runner needs Xcode command-line tools. The Windows runner needs Visual
 Studio 2022 with Desktop development with C++, Windows SDK signing tools, and
-Inno Setup 6. Both need Flutter 3.47.1-compatible host dependencies.
+Inno Setup 6. Both need Flutter 3.47.1-compatible host dependencies and GitHub
+Actions Runner 2.327.1 or newer for the Node 24-based checkout action.
 
 ## Release sequence
 

@@ -44,7 +44,7 @@ jobs:
       UPDATE_FEED_URL: ${{ vars.FOCUS_FLOW_UPDATE_FEED_URL }}
       DIAGNOSTICS_URL: ${{ vars.FOCUS_FLOW_DIAGNOSTICS_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: 3.47.1
@@ -135,7 +135,7 @@ jobs:
       UPDATE_FEED_URL: ${{ vars.FOCUS_FLOW_UPDATE_FEED_URL }}
       DIAGNOSTICS_URL: ${{ vars.FOCUS_FLOW_DIAGNOSTICS_URL }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: 3.47.1

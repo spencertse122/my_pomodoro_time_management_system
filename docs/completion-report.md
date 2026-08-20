@@ -17,7 +17,7 @@ require publisher credentials, licensed artifacts, or target hardware.
 | Categories and dashboard | Default/editable categories, AI allowlist, confidence review, manual retagging, per-app rules, observed totals, separate Pomodoro lane | Repository, controller, local-AI, and dashboard tests |
 | Consent and controls | First-run disclosure, current-notice gate, explicit permission action, pause/disable, idle/lock skip, app exclusion, launch at login, diagnostics control | Onboarding, controller, settings persistence, diagnostics tests |
 | Data portability and deletion | Device-wide passphrase-encrypted backup, exact schema validation, rollback-safe staged restore, explicit legacy import/purge verification, write-drained local hard deletion | Backup, migration, auth, timer, and database tests |
-| Release path | Hosted CI for macOS/Windows smoke builds; protected self-hosted signed release workflow; model hash verification; DMG and Inno packaging | YAML parsing and `actionlint` |
+| Release path | Hosted CI for macOS/Windows smoke builds; protected self-hosted signed release workflow; model hash verification; DMG and Inno packaging | Green hosted validation and target-release builds; YAML parsing and `actionlint` |
 
 ## Local validation completed
 
@@ -41,10 +41,16 @@ current-notice consent gates, local-AI validation/backpressure, categories/rules
 dashboard behavior, diagnostics, update endpoint validation, timer state, and
 user isolation.
 
+[GitHub Actions run 32374734923](https://github.com/spencertse122/my_pomodoro_time_management_system/actions/runs/32374734923)
+also passed the same validation suite plus real `flutter build macos --release`
+and `flutter build windows --release` jobs on their target hosted toolchains.
+
 ## Not verifiable in this environment
 
-- Native macOS and Windows compilation and physical permission flows. The
-  current host is Linux and the project intentionally has no Linux target.
+- Physical macOS and Windows permission, lock-screen, multi-display, and
+  launch-at-login flows on end-user hardware. Target release compilation is
+  verified by hosted CI, but the current local host is Linux and the project
+  intentionally has no Linux target.
 - Real Gemma image inference, latency, and memory/thermal behavior. Licensed
   model/projector files are intentionally absent from Git.
 - Apple Silicon signing/notarization/Gatekeeper and Windows Authenticode,
