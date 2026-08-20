@@ -1,0 +1,42 @@
+{
+  "auth": {
+    "providers": {
+      "emailPassword": true
+    }
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "emulators": {
+    "auth": {
+      "port": 9099
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "ui": {
+      "enabled": true
+    }
+  },
+  "flutter": {
+    "platforms": {
+      "macos": {
+        "default": {
+          "projectId": "focus-flow-spencertse",
+          "appId": "1:1095571911160:ios:ba08f66d313cdb0992e60d",
+          "uploadDebugSymbols": false,
+          "fileOutput": "macos/Runner/GoogleService-Info.plist"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "focus-flow-spencertse",
+          "configurations": {
+            "macos": "1:1095571911160:ios:ba08f66d313cdb0992e60d",
+            "windows": "1:1095571911160:web:7252ff59a8b93bad92e60d"
+          }
+        }
+      }
+    }
+  }
+}
