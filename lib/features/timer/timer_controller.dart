@@ -37,6 +37,9 @@ class TimerController extends ChangeNotifier {
   final Uuid _uuid;
   Timer? _ticker;
   bool _completing = false;
+  bool _accountDeletionSuspended = false;
+  bool _disposed = false;
+  Completer<void>? _activeCompletion;
 
   TimerSnapshot snapshot;
   PomodoroSettings settings = const PomodoroSettings();
@@ -44,10 +47,7 @@ class TimerController extends ChangeNotifier {
 
   int get remainingSeconds {
     if (snapshot.state == TimerRunState.running && snapshot.deadline != null) {
-      return snapshot.deadline!
-          .difference(_now())
-          .inSeconds
-          .clamp(0, snapshot.plannedSeconds);
+      return _remainingAt(_now());
     }
     return (snapshot.plannedSeconds - snapshot.accumulatedSeconds).clamp(
       0,
@@ -84,10 +84,8 @@ class TimerController extends ChangeNotifier {
   }
 
   Future<void> startFocus(String activity) async {
-    final value = activity.trim();
-    if (value.isEmpty) {
-      throw ArgumentError('Describe what you are focusing on.');
-    }
+    _ensureWritable();
+    final value = _validatedActivity(activity);
     await _begin(
       phase: TimerPhase.focus,
       activity: value,
@@ -97,15 +95,13 @@ class TimerController extends ChangeNotifier {
   }
 
   Future<void> startSuggested({String? focusActivity}) async {
+    _ensureWritable();
     if (snapshot.state != TimerRunState.awaitingNext) return;
     final phase = suggestedPhase;
     var activity = snapshot.activity;
     var completed = snapshot.completedFocusesInCycle;
     if (phase == TimerPhase.focus) {
-      activity = (focusActivity ?? activity).trim();
-      if (activity.isEmpty) {
-        throw ArgumentError('Describe what you are focusing on.');
-      }
+      activity = _validatedActivity(focusActivity ?? activity);
       if (snapshot.phase == TimerPhase.longBreak) completed = 0;
     }
     await _begin(
@@ -143,6 +139,7 @@ class TimerController extends ChangeNotifier {
   }
 
   Future<void> pause() async {
+    _ensureWritable();
     if (snapshot.state != TimerRunState.running) return;
     final elapsed = _elapsedAt(_now());
     snapshot = snapshot.copyWith(
@@ -156,6 +153,7 @@ class TimerController extends ChangeNotifier {
   }
 
   Future<void> resume() async {
+    _ensureWritable();
     if (snapshot.state != TimerRunState.paused) return;
     final now = _now();
     snapshot = snapshot.copyWith(
@@ -168,6 +166,7 @@ class TimerController extends ChangeNotifier {
   }
 
   Future<void> stop() async {
+    _ensureWritable();
     if (snapshot.state != TimerRunState.running &&
         snapshot.state != TimerRunState.paused) {
       return;
@@ -188,6 +187,7 @@ class TimerController extends ChangeNotifier {
   }
 
   Future<void> resetCycle() async {
+    _ensureWritable();
     _ticker?.cancel();
     snapshot = TimerSnapshot.idle(_userId);
     await _database.saveTimer(snapshot);
@@ -195,6 +195,7 @@ class TimerController extends ChangeNotifier {
   }
 
   Future<void> updateSettings(PomodoroSettings value) async {
+    _ensureWritable();
     settings = value;
     await _settingsRepository.save(_userId, value);
     notifyListeners();
@@ -202,18 +203,35 @@ class TimerController extends ChangeNotifier {
 
   int _elapsedAt(DateTime now) {
     if (snapshot.deadline == null) return snapshot.accumulatedSeconds;
-    final remaining = snapshot.deadline!
-        .difference(now)
-        .inSeconds
-        .clamp(0, snapshot.plannedSeconds);
+    final remaining = _remainingAt(now);
     return (snapshot.plannedSeconds - remaining).clamp(
       0,
       snapshot.plannedSeconds,
     );
   }
 
+  int _remainingAt(DateTime now) {
+    final milliseconds = snapshot.deadline!.difference(now).inMilliseconds;
+    if (milliseconds <= 0) return 0;
+    // A partially elapsed second still belongs to the user. Rounding down here
+    // makes the display tick early and overstates short, stopped sessions.
+    return ((milliseconds + 999) ~/ 1000).clamp(0, snapshot.plannedSeconds);
+  }
+
+  String _validatedActivity(String activity) {
+    final value = activity.trim();
+    if (value.isEmpty) {
+      throw ArgumentError('Describe what you are focusing on.');
+    }
+    if (value.length > 160) {
+      throw ArgumentError('Keep the focus description under 160 characters.');
+    }
+    return value;
+  }
+
   void _startTicker() {
     _ticker?.cancel();
+    if (_accountDeletionSuspended || _disposed) return;
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) async {
       if (remainingSeconds <= 0) {
         await _complete(playNotification: true);
@@ -224,34 +242,67 @@ class TimerController extends ChangeNotifier {
   }
 
   Future<void> _complete({required bool playNotification}) async {
-    if (_completing || snapshot.state != TimerRunState.running) return;
-    _completing = true;
-    _ticker?.cancel();
-    final completedPhase = snapshot.phase;
-    final end = snapshot.deadline ?? _now();
-    await _saveSession(
-      outcome: SessionOutcome.completed,
-      actualSeconds: snapshot.plannedSeconds,
-      endedAt: end,
-    );
-    var completedFocuses = snapshot.completedFocusesInCycle;
-    if (snapshot.phase == TimerPhase.focus) completedFocuses++;
-    if (snapshot.phase == TimerPhase.longBreak) completedFocuses = 0;
-    snapshot = snapshot.copyWith(
-      state: TimerRunState.awaitingNext,
-      completedFocusesInCycle: completedFocuses,
-      accumulatedSeconds: snapshot.plannedSeconds,
-      clearDeadline: true,
-    );
-    await _database.saveTimer(snapshot);
-    if (playNotification) {
-      await _notifier.showCompletion(
-        completedPhase,
-        playSound: settings.soundEnabled,
-      );
+    if (_completing ||
+        _accountDeletionSuspended ||
+        _disposed ||
+        snapshot.state != TimerRunState.running) {
+      return;
     }
-    _completing = false;
-    notifyListeners();
+    _completing = true;
+    final completion = Completer<void>();
+    _activeCompletion = completion;
+    _ticker?.cancel();
+    try {
+      final completedPhase = snapshot.phase;
+      final end = snapshot.deadline ?? _now();
+      await _saveSession(
+        outcome: SessionOutcome.completed,
+        actualSeconds: snapshot.plannedSeconds,
+        endedAt: end,
+      );
+      var completedFocuses = snapshot.completedFocusesInCycle;
+      if (snapshot.phase == TimerPhase.focus) completedFocuses++;
+      if (snapshot.phase == TimerPhase.longBreak) completedFocuses = 0;
+      snapshot = snapshot.copyWith(
+        state: TimerRunState.awaitingNext,
+        completedFocusesInCycle: completedFocuses,
+        accumulatedSeconds: snapshot.plannedSeconds,
+        clearDeadline: true,
+      );
+      await _database.saveTimer(snapshot);
+      if (playNotification) {
+        try {
+          await _notifier.showCompletion(
+            completedPhase,
+            playSound: settings.soundEnabled,
+          );
+        } on Object {
+          // Session completion is durable even when the desktop notification
+          // backend is unavailable or loses permission at runtime.
+        }
+      }
+    } finally {
+      _completing = false;
+      if (identical(_activeCompletion, completion)) {
+        _activeCompletion = null;
+      }
+      if (!completion.isCompleted) completion.complete();
+      if (!_disposed) notifyListeners();
+    }
+  }
+
+  /// Prevents any timer callback from recreating rows after local account
+  /// deletion and waits for a completion that already crossed the write gate.
+  Future<void> suspendForAccountDeletion() async {
+    _accountDeletionSuspended = true;
+    _ticker?.cancel();
+    await _activeCompletion?.future;
+  }
+
+  void _ensureWritable() {
+    if (_accountDeletionSuspended || _disposed) {
+      throw StateError('The timer is stopping for account deletion.');
+    }
   }
 
   Future<void> _saveSession({
@@ -278,6 +329,8 @@ class TimerController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _accountDeletionSuspended = true;
     _ticker?.cancel();
     super.dispose();
   }

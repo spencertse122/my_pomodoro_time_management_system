@@ -129,6 +129,39 @@ void main() {
       );
     },
   );
+
+  test('account deletion removes the OS-protected refresh token', () async {
+    final database = AppDatabase(NativeDatabase.memory());
+    addTearDown(database.close);
+    final secureStore = _MemorySecureStore();
+    final auth = await AuthService.create(
+      database: database,
+      apiKey: 'test-key',
+      secureStore: secureStore,
+      client: MockClient((request) async {
+        if (request.url.path.endsWith('/accounts:delete')) {
+          return http.Response('{}', 200);
+        }
+        return http.Response(
+          jsonEncode({
+            'localId': 'delete-user',
+            'email': 'delete@example.com',
+            'idToken': 'short-lived-id-token',
+            'refreshToken': 'long-lived-secret',
+            'expiresIn': '3600',
+          }),
+          200,
+        );
+      }),
+    );
+    await auth.signIn('delete@example.com', 'password');
+
+    await auth.deleteAccount();
+
+    expect(auth.currentUser, isNull);
+    expect(await database.storedAuth(), isNull);
+    expect(await secureStore.refreshToken('delete-user'), isNull);
+  });
 }
 
 class _MemorySecureStore extends SecureStore {

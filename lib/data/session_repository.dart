@@ -43,7 +43,7 @@ class SessionRepository {
   );
 
   Future<void> delete(WorkSession session) =>
-      _database.hardDeleteSession(session.id);
+      _database.hardDeleteSessionForUser(session.userId, session.id);
 
   Future<List<WorkSession>> all(String userId) => _database.allSessions(userId);
 }

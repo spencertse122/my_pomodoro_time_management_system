@@ -364,11 +364,21 @@ class AppDatabase extends _$AppDatabase {
     return row == null ? null : _sessionFromRow(row);
   }
 
+  Future<WorkSession?> sessionByIdForUser(String userId, String id) async {
+    final row =
+        await (select(sessionEntries)..where(
+              (entry) => entry.id.equals(id) & entry.userId.equals(userId),
+            ))
+            .getSingleOrNull();
+    return row == null ? null : _sessionFromRow(row);
+  }
+
   Future<void> upsertSession(WorkSession session) =>
       into(sessionEntries).insertOnConflictUpdate(_sessionToCompanion(session));
 
-  Future<void> hardDeleteSession(String id) =>
-      (delete(sessionEntries)..where((row) => row.id.equals(id))).go();
+  Future<void> hardDeleteSessionForUser(String userId, String id) => (delete(
+    sessionEntries,
+  )..where((row) => row.id.equals(id) & row.userId.equals(userId))).go();
 
   Future<TimerSnapshot?> activeTimer(String userId) async {
     final row = await (select(

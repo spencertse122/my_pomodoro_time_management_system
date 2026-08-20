@@ -75,6 +75,16 @@ class MainFlutterWindow: NSWindow {
     case "getActivitySnapshot":
       result(activitySnapshot())
     case "captureDisplays":
+      guard !screenIsLocked() else {
+        result(
+          FlutterError(
+            code: "session-locked",
+            message: "Display capture is unavailable while the session is locked.",
+            details: nil
+          )
+        )
+        return
+      }
       guard CGPreflightScreenCaptureAccess() else {
         result(
           FlutterError(
@@ -91,13 +101,24 @@ class MainFlutterWindow: NSWindow {
           DispatchQueue.main.async { result(displays) }
         } catch {
           DispatchQueue.main.async {
-            result(
-              FlutterError(
-                code: "capture-failed",
-                message: "Display capture failed.",
-                details: String(describing: error)
+            switch error {
+            case ActivityCaptureError.sessionLocked:
+              result(
+                FlutterError(
+                  code: "session-locked",
+                  message: "Display capture stopped because the session locked.",
+                  details: nil
+                )
               )
-            )
+            default:
+              result(
+                FlutterError(
+                  code: "capture-failed",
+                  message: "Display capture failed.",
+                  details: nil
+                )
+              )
+            }
           }
         }
       }
@@ -118,11 +139,51 @@ class MainFlutterWindow: NSWindow {
       do {
         let service = SMAppService.mainApp
         if enabled {
-          if service.status != .enabled {
+          switch service.status {
+          case .enabled:
+            break
+          case .requiresApproval:
+            SMAppService.openSystemSettingsLoginItems()
+          case .notRegistered:
             try service.register()
+            if service.status == .requiresApproval {
+              SMAppService.openSystemSettingsLoginItems()
+            }
+          case .notFound:
+            result(
+              FlutterError(
+                code: "launch-at-login-unavailable",
+                message: "macOS could not find the main application login item.",
+                details: nil
+              )
+            )
+            return
+          @unknown default:
+            result(
+              FlutterError(
+                code: "launch-at-login-unavailable",
+                message: "macOS returned an unknown login-item status.",
+                details: nil
+              )
+            )
+            return
           }
-        } else if service.status != .notRegistered {
-          try service.unregister()
+        } else {
+          switch service.status {
+          case .enabled, .requiresApproval:
+            try service.unregister()
+          case .notRegistered, .notFound:
+            break
+          @unknown default:
+            result(
+              FlutterError(
+                code: "launch-at-login-unavailable",
+                message: "macOS returned an unknown login-item status.",
+                details: nil
+              )
+            )
+            return
+          }
         }
         result(service.status == .enabled)
       } catch {
@@ -187,9 +248,14 @@ class MainFlutterWindow: NSWindow {
   @available(macOS 13.0, *)
   private func screenIsLocked() -> Bool {
     guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else {
-      return false
+      // Treat an unreadable session state as locked so pixel capture fails
+      // closed instead of guessing that private content is available.
+      return true
     }
-    return (session["CGSSessionScreenIsLocked"] as? Bool) ?? false
+    guard let isLocked = session["CGSSessionScreenIsLocked"] as? Bool else {
+      return true
+    }
+    return isLocked
   }
 
   @available(macOS 13.0, *)
@@ -231,11 +297,20 @@ class MainFlutterWindow: NSWindow {
       $0.bundleIdentifier == ownBundleIdentifier
     }
     for display in content.displays {
+      guard !screenIsLocked() else {
+        throw ActivityCaptureError.sessionLocked
+      }
       let frameCapture = ScreenCaptureFrame()
       let pngData = try await frameCapture.capture(
         display: display,
         excludingApplications: excludedApplications
       )
+      // Lock state can change while ScreenCaptureKit is producing a frame.
+      // Discard all payloads instead of analyzing pixels captured across that
+      // privacy boundary.
+      guard !screenIsLocked() else {
+        throw ActivityCaptureError.sessionLocked
+      }
       payloads.append([
         "id": String(display.displayID),
         "width": display.width,
@@ -265,6 +340,7 @@ private enum ActivityCaptureConstants {
 private enum ActivityCaptureError: LocalizedError {
   case noDisplays
   case pngEncodingFailed
+  case sessionLocked
   case timedOut
 
   var errorDescription: String? {
@@ -273,6 +349,8 @@ private enum ActivityCaptureError: LocalizedError {
       return "No displays are available for capture."
     case .pngEncodingFailed:
       return "The captured frame could not be encoded as PNG."
+    case .sessionLocked:
+      return "Display capture stopped because the session locked."
     case .timedOut:
       return "ScreenCaptureKit timed out waiting for a frame."
     }
@@ -296,7 +374,9 @@ private final class ScreenCaptureFrame: NSObject, SCStreamOutput {
     configuration.width = display.width
     configuration.height = display.height
     configuration.pixelFormat = kCVPixelFormatType_32BGRA
-    configuration.queueDepth = 1
+    // ScreenCaptureKit documents three frames as the minimum queue depth.
+    // Capture still stops after the first complete frame, so no image persists.
+    configuration.queueDepth = 3
     configuration.showsCursor = false
     configuration.capturesAudio = false
 
@@ -334,6 +414,14 @@ private final class ScreenCaptureFrame: NSObject, SCStreamOutput {
   ) {
     guard outputType == .screen,
       sampleBuffer.isValid,
+      let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(
+        sampleBuffer,
+        createIfNecessary: false
+      ) as? [[SCStreamFrameInfo: Any]],
+      let attachments = attachmentsArray.first,
+      let statusRawValue = attachments[SCStreamFrameInfo.status] as? Int,
+      let status = SCFrameStatus(rawValue: statusRawValue),
+      status == .complete,
       let pixelBuffer = sampleBuffer.imageBuffer
     else {
       return
@@ -365,9 +453,9 @@ private final class ScreenCaptureFrame: NSObject, SCStreamOutput {
     stream = nil
     lock.unlock()
 
+    continuation.resume(with: result)
     Task {
       try? await activeStream?.stopCapture()
-      continuation.resume(with: result)
     }
   }
 }

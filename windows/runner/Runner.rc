@@ -92,9 +92,9 @@ BEGIN
             VALUE "CompanyName", "com.spencertse" "\0"
             VALUE "FileDescription", "Focus Flow" "\0"
             VALUE "FileVersion", VERSION_AS_STRING "\0"
-            VALUE "InternalName", "my_pomodoro_time_management_system" "\0"
+            VALUE "InternalName", "FocusFlow" "\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 com.spencertse. All rights reserved." "\0"
-            VALUE "OriginalFilename", "my_pomodoro_time_management_system.exe" "\0"
+            VALUE "OriginalFilename", "FocusFlow.exe" "\0"
             VALUE "ProductName", "Focus Flow" "\0"
             VALUE "ProductVersion", VERSION_AS_STRING "\0"
         END

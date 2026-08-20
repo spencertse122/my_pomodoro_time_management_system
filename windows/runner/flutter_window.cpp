@@ -32,14 +32,16 @@ bool FlutterWindow::OnCreate() {
   }
   RegisterPlugins(flutter_controller_->engine());
   session_locked_ = IsCurrentSessionLocked();
+  // Fail closed if Windows cannot keep Focus Flow's own top-level window out
+  // of display captures. The method channel checks this state before BitBlt.
+  capture_exclusion_ready_ =
+      SetWindowDisplayAffinity(GetHandle(), WDA_EXCLUDEFROMCAPTURE) == TRUE;
   activity_capture_channel_ = RegisterActivityCaptureChannel(
-      flutter_controller_->engine()->messenger(), &session_locked_);
+      flutter_controller_->engine()->messenger(), &session_locked_,
+      &capture_exclusion_ready_);
   session_notifications_registered_ =
       WTSRegisterSessionNotification(GetHandle(), NOTIFY_FOR_THIS_SESSION) ==
       TRUE;
-  // Prevent Focus Flow's own window (which can show private history or backup
-  // controls) from appearing in display captures on supported Windows builds.
-  SetWindowDisplayAffinity(GetHandle(), WDA_EXCLUDEFROMCAPTURE);
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {

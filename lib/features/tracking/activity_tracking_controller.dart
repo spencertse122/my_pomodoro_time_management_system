@@ -67,8 +67,10 @@ class ActivityTrackingController extends ChangeNotifier {
 
   Timer? _timer;
   Completer<void>? _captureCompletion;
+  Future<void>? _diagnosticsFlush;
   bool _isCapturing = false;
   bool _disposed = false;
+  bool _accountDeletionSuspended = false;
   DateTime? _lastActiveCaptureAt;
 
   TrackingSettings settings = const TrackingSettings();
@@ -83,7 +85,10 @@ class ActivityTrackingController extends ChangeNotifier {
   int inferenceFailures = 0;
 
   bool get initialized => aiAvailability != null;
-  bool get isActivelyTracking => settings.trackingEnabled && !settings.isPaused;
+  bool get isActivelyTracking =>
+      settings.trackingEnabled &&
+      _hasCurrentPrivacyConsent &&
+      !settings.isPaused;
   bool get isBusy => _isCapturing;
 
   Future<void> initialize() async {
@@ -95,12 +100,23 @@ class ActivityTrackingController extends ChangeNotifier {
       permission = ActivityCapturePermissionStatus.unsupported;
     }
     aiAvailability = await _localAi.availability();
-    unawaited(_flushDiagnostics());
+    try {
+      final launchAtLogin = await _capture.isLaunchAtLoginEnabled();
+      if (launchAtLogin != settings.launchAtLogin) {
+        settings = settings.copyWith(launchAtLogin: launchAtLogin);
+        await _settingsRepository.save(_userId, settings);
+      }
+    } on Object {
+      // A platform login-item lookup must not prevent local tracking startup.
+    }
+    _diagnosticsFlush = _flushDiagnostics();
+    unawaited(_diagnosticsFlush);
     _reschedule(captureImmediately: settings.trackingEnabled);
     notifyListeners();
   }
 
   Future<bool> completeOnboardingAndEnable() async {
+    _ensureWritable();
     final requested = await _capture.requestPermission();
     permission = requested;
     final enabled = requested == ActivityCapturePermissionStatus.granted;
@@ -117,6 +133,7 @@ class ActivityTrackingController extends ChangeNotifier {
   }
 
   Future<void> completeOnboardingWithoutTracking() async {
+    _ensureWritable();
     settings = settings.copyWith(
       onboardingComplete: true,
       privacyNoticeVersion: privacyNoticeVersion,
@@ -129,6 +146,12 @@ class ActivityTrackingController extends ChangeNotifier {
   }
 
   Future<bool> enableTracking() async {
+    _ensureWritable();
+    if (!_hasCurrentPrivacyConsent) {
+      status = ActivityTrackingStatus.disabled;
+      notifyListeners();
+      return false;
+    }
     var currentPermission = await _capture.permissionStatus();
     if (currentPermission != ActivityCapturePermissionStatus.granted) {
       currentPermission = await _capture.requestPermission();
@@ -147,6 +170,7 @@ class ActivityTrackingController extends ChangeNotifier {
   }
 
   Future<void> disableTracking() async {
+    _ensureWritable();
     settings = settings.copyWith(trackingEnabled: false, clearPause: true);
     await _settingsRepository.save(_userId, settings);
     _lastActiveCaptureAt = null;
@@ -156,6 +180,7 @@ class ActivityTrackingController extends ChangeNotifier {
   }
 
   Future<void> pauseFor(Duration duration) async {
+    _ensureWritable();
     settings = settings.copyWith(
       pausedUntil: DateTime.now().toUtc().add(duration),
     );
@@ -166,6 +191,7 @@ class ActivityTrackingController extends ChangeNotifier {
   }
 
   Future<void> resume() async {
+    _ensureWritable();
     settings = settings.copyWith(clearPause: true);
     await _settingsRepository.save(_userId, settings);
     _reschedule(captureImmediately: settings.trackingEnabled);
@@ -199,6 +225,7 @@ class ActivityTrackingController extends ChangeNotifier {
   );
 
   Future<void> updateTrackingSettings(TrackingSettings value) async {
+    _ensureWritable();
     final intervalChanged =
         value.captureIntervalMinutes != settings.captureIntervalMinutes;
     final scheduleChanged =
@@ -231,15 +258,20 @@ class ActivityTrackingController extends ChangeNotifier {
   }
 
   Future<void> captureNow() async {
-    if (_disposed || !settings.trackingEnabled || settings.isPaused) {
+    if (_disposed ||
+        _accountDeletionSuspended ||
+        !_hasCurrentPrivacyConsent ||
+        !settings.trackingEnabled ||
+        settings.isPaused) {
       status = settings.isPaused
           ? ActivityTrackingStatus.paused
           : ActivityTrackingStatus.disabled;
+      if (!_disposed) notifyListeners();
       return;
     }
     if (_isCapturing) {
       capturesSkipped++;
-      unawaited(_recordDiagnostic('skipped'));
+      await _recordDiagnostic('skipped');
       notifyListeners();
       return;
     }
@@ -253,17 +285,17 @@ class ActivityTrackingController extends ChangeNotifier {
     try {
       final snapshot = await _capture.getActivitySnapshot();
       if (snapshot.isLocked) {
-        _skip(ActivityTrackingStatus.locked);
+        await _skip(ActivityTrackingStatus.locked);
         return;
       }
       if (snapshot.idleDuration >=
           Duration(minutes: settings.idleThresholdMinutes)) {
-        _skip(ActivityTrackingStatus.idle);
+        await _skip(ActivityTrackingStatus.idle);
         return;
       }
       final app = snapshot.foregroundApplication;
       if (app == null) {
-        _skip(ActivityTrackingStatus.metadataOnly);
+        await _skip(ActivityTrackingStatus.metadataOnly);
         return;
       }
       final boundedAppName = _bounded(app.name, 200);
@@ -278,7 +310,7 @@ class ActivityTrackingController extends ChangeNotifier {
       );
       if (_isFocusFlow(appId, appName) ||
           settings.excludedAppIds.contains(appId)) {
-        _skip(ActivityTrackingStatus.waiting);
+        await _skip(ActivityTrackingStatus.waiting);
         return;
       }
 
@@ -301,7 +333,7 @@ class ActivityTrackingController extends ChangeNotifier {
       persistedSample = await _activities.saveSample(sample);
       if (persistedSample.categorySource == ActivityCategorySource.rule) {
         capturesSucceeded++;
-        unawaited(_recordDiagnostic('success'));
+        await _recordDiagnostic('success');
         status = ActivityTrackingStatus.waiting;
         lastCompletedAt = DateTime.now().toUtc();
         return;
@@ -310,19 +342,26 @@ class ActivityTrackingController extends ChangeNotifier {
       if (permission != ActivityCapturePermissionStatus.granted) {
         await _activities.markMetadataOnly(persistedSample, 'permissionDenied');
         status = ActivityTrackingStatus.permissionDenied;
-        unawaited(_recordDiagnostic('skipped'));
+        await _recordDiagnostic('skipped');
         return;
       }
 
-      final displays = await _capture.captureDisplays();
+      var displays = await _capture.captureDisplays();
       final categories = await _categories.get(_userId);
       status = ActivityTrackingStatus.analyzing;
       notifyListeners();
-      final result = await _localAi.classifyActivity(
-        snapshot: snapshot,
-        displays: displays,
-        categories: categories,
-      );
+      late final LocalAiResult<ActivityClassification> result;
+      try {
+        result = await _localAi.classifyActivity(
+          snapshot: snapshot,
+          displays: displays,
+          categories: categories,
+        );
+      } finally {
+        // Release the controller's last image references before any database
+        // or diagnostics work continues.
+        displays = const [];
+      }
       final classification = result.value;
       if (classification != null) {
         await _activities.saveClassification(
@@ -335,7 +374,7 @@ class ActivityTrackingController extends ChangeNotifier {
           promptVersion: classification.promptVersion,
         );
         capturesSucceeded++;
-        unawaited(_recordDiagnostic('success'));
+        await _recordDiagnostic('success');
         status = ActivityTrackingStatus.waiting;
       } else {
         final failure = result.failure!;
@@ -345,14 +384,14 @@ class ActivityTrackingController extends ChangeNotifier {
             failure.storageCode,
           );
           status = ActivityTrackingStatus.metadataOnly;
-          unawaited(_recordDiagnostic('skipped'));
+          await _recordDiagnostic('skipped');
         } else {
           await _activities.markClassificationFailed(
             persistedSample,
             failure.storageCode,
           );
           inferenceFailures++;
-          unawaited(_recordDiagnostic('inferenceFailure'));
+          await _recordDiagnostic('inferenceFailure');
           status = ActivityTrackingStatus.error;
         }
         lastError = failure.message;
@@ -360,7 +399,7 @@ class ActivityTrackingController extends ChangeNotifier {
       lastCompletedAt = DateTime.now().toUtc();
     } on Object catch (error) {
       capturesSkipped++;
-      unawaited(_recordDiagnostic('captureFailure'));
+      await _recordDiagnostic('captureFailure');
       status = ActivityTrackingStatus.error;
       lastError = _safeError(error);
       if (persistedSample != null) {
@@ -377,11 +416,21 @@ class ActivityTrackingController extends ChangeNotifier {
       if (identical(_captureCompletion, completion)) {
         _captureCompletion = null;
       }
-      if (!_disposed) notifyListeners();
+      if (!_disposed) {
+        // A disable or pause can race an in-flight local inference. Preserve
+        // the user's latest control state after that work drains.
+        if (!settings.trackingEnabled || !_hasCurrentPrivacyConsent) {
+          status = ActivityTrackingStatus.disabled;
+        } else if (settings.isPaused) {
+          status = ActivityTrackingStatus.paused;
+        }
+        notifyListeners();
+      }
     }
   }
 
   Future<void> generateDailyInsight(DateTime day) async {
+    _ensureWritable();
     final blocks = await _activities.watchDay(_userId, day).first;
     final pomodoros = await _sessions.watchDay(_userId, day).first;
     final categories = await _categories.get(_userId);
@@ -404,12 +453,37 @@ class ActivityTrackingController extends ChangeNotifier {
     );
     final insight = result.value;
     if (insight == null) throw StateError(result.failure!.message);
+    _ensureWritable();
     await _insights.save(insight);
   }
 
-  void _skip(ActivityTrackingStatus value) {
+  /// Stops scheduled and in-flight capture writes before local account rows
+  /// are removed, then rejects every later mutation from UI or tray callbacks.
+  Future<void> suspendForAccountDeletion() async {
+    if (_accountDeletionSuspended) {
+      await _captureCompletion?.future;
+      return;
+    }
+    _accountDeletionSuspended = true;
+    _timer?.cancel();
+    settings = settings.copyWith(trackingEnabled: false, clearPause: true);
+    await _settingsRepository.save(_userId, settings);
+    _lastActiveCaptureAt = null;
+    status = ActivityTrackingStatus.disabled;
+    notifyListeners();
+    await _captureCompletion?.future;
+    await _diagnosticsFlush;
+  }
+
+  void _ensureWritable() {
+    if (_accountDeletionSuspended || _disposed) {
+      throw StateError('Activity tracking is stopping for account deletion.');
+    }
+  }
+
+  Future<void> _skip(ActivityTrackingStatus value) async {
     capturesSkipped++;
-    unawaited(_recordDiagnostic('skipped'));
+    await _recordDiagnostic('skipped');
     _lastActiveCaptureAt = null;
     status = value;
     lastCompletedAt = DateTime.now().toUtc();
@@ -417,7 +491,7 @@ class ActivityTrackingController extends ChangeNotifier {
 
   void _reschedule({bool captureImmediately = false}) {
     _timer?.cancel();
-    if (!settings.trackingEnabled) {
+    if (!settings.trackingEnabled || !_hasCurrentPrivacyConsent) {
       status = ActivityTrackingStatus.disabled;
       return;
     }
@@ -467,7 +541,7 @@ class ActivityTrackingController extends ChangeNotifier {
   Future<void> _recordDiagnostic(String outcome) async {
     try {
       final database = _diagnosticsDatabase;
-      if (database == null || !settings.diagnosticsEnabled) return;
+      if (database == null || !_hasDiagnosticsConsent) return;
       await database.incrementDiagnostic(
         event: 'activityCapture',
         outcome: outcome,
@@ -485,7 +559,7 @@ class ActivityTrackingController extends ChangeNotifier {
       if (database == null || diagnostics == null) return;
       final counters = await database.diagnosticCounters();
       if (counters.isEmpty) return;
-      if (!settings.diagnosticsEnabled) {
+      if (!_hasDiagnosticsConsent) {
         await database.deleteDiagnosticCounters(counters);
         return;
       }
@@ -494,7 +568,7 @@ class ActivityTrackingController extends ChangeNotifier {
           .where((counter) => counter.outcome == outcome)
           .fold(0, (sum, counter) => sum + counter.count);
       final sent = await diagnostics.sendDailyHealth(
-        enabled: true,
+        enabled: _hasDiagnosticsConsent,
         platform: Platform.operatingSystem,
         appVersion: package.version,
         capturesSucceeded: count('success'),
@@ -507,9 +581,19 @@ class ActivityTrackingController extends ChangeNotifier {
     }
   }
 
+  bool get _hasDiagnosticsConsent =>
+      !_accountDeletionSuspended &&
+      settings.diagnosticsEnabled &&
+      _hasCurrentPrivacyConsent;
+
+  bool get _hasCurrentPrivacyConsent =>
+      settings.onboardingComplete &&
+      settings.privacyNoticeVersion >= privacyNoticeVersion;
+
   @override
   void dispose() {
     _disposed = true;
+    _accountDeletionSuspended = true;
     _timer?.cancel();
     unawaited(_localAi.dispose());
     super.dispose();

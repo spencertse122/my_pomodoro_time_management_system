@@ -8,8 +8,9 @@ generate daily summaries entirely on the user's machine.
 ## Privacy guarantees
 
 - Personal activity data is stored only in a local SQLCipher-compatible
-  `sqlite3mc` database. Its random key is held by Keychain on macOS or Windows
-  Credential Manager.
+  `sqlite3mc` database. Its random key is held by Keychain on macOS; on Windows,
+  secure-storage values use AES-GCM with the key stored in Windows Credential
+  Manager.
 - Screenshots are captured only after explicit consent, passed from native
   memory directly to local inference, and never written to disk, the database,
   logs, backups, diagnostics, Firebase, or another network service.
@@ -21,7 +22,9 @@ generate daily summaries entirely on the user's machine.
   aggregate diagnostics.
 
 The complete boundary and data inventory are in [docs/privacy.md](docs/privacy.md)
-and [docs/architecture.md](docs/architecture.md).
+and [docs/architecture.md](docs/architecture.md). Repository verification and
+external release gates are recorded in
+[docs/completion-report.md](docs/completion-report.md).
 
 ## Product behavior
 

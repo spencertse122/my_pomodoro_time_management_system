@@ -3,12 +3,15 @@ import 'dart:async';
 import 'package:drift/native.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:my_pomodoro_time_management_system/data/activity_repository.dart';
 import 'package:my_pomodoro_time_management_system/data/local/app_database.dart';
 import 'package:my_pomodoro_time_management_system/data/session_repository.dart';
 import 'package:my_pomodoro_time_management_system/domain/models.dart';
 import 'package:my_pomodoro_time_management_system/features/tracking/activity_tracking_controller.dart';
 import 'package:my_pomodoro_time_management_system/services/activity_capture_service.dart';
+import 'package:my_pomodoro_time_management_system/services/diagnostics_service.dart';
 import 'package:my_pomodoro_time_management_system/services/local_ai_service.dart';
 
 void main() {
@@ -93,7 +96,11 @@ void main() {
       );
       addTearDown(controller.dispose);
       await controller.initialize();
-      controller.settings = controller.settings.copyWith(trackingEnabled: true);
+      controller.settings = controller.settings.copyWith(
+        trackingEnabled: true,
+        onboardingComplete: true,
+        privacyNoticeVersion: ActivityTrackingController.privacyNoticeVersion,
+      );
 
       await controller.captureNow();
 
@@ -149,7 +156,11 @@ void main() {
       );
       addTearDown(controller.dispose);
       await controller.initialize();
-      controller.settings = controller.settings.copyWith(trackingEnabled: true);
+      controller.settings = controller.settings.copyWith(
+        trackingEnabled: true,
+        onboardingComplete: true,
+        privacyNoticeVersion: ActivityTrackingController.privacyNoticeVersion,
+      );
 
       await controller.captureNow();
 
@@ -224,7 +235,11 @@ void main() {
       );
       addTearDown(controller.dispose);
       await controller.initialize();
-      controller.settings = controller.settings.copyWith(trackingEnabled: true);
+      controller.settings = controller.settings.copyWith(
+        trackingEnabled: true,
+        onboardingComplete: true,
+        privacyNoticeVersion: ActivityTrackingController.privacyNoticeVersion,
+      );
 
       final capture = controller.captureNow();
       await inferenceStarted.future;
@@ -239,6 +254,138 @@ void main() {
       await Future.wait([capture, disabling]);
       expect(disabled, isTrue);
       expect(controller.settings.trackingEnabled, isFalse);
+      expect(controller.status, ActivityTrackingStatus.disabled);
     },
   );
+
+  test(
+    'pending diagnostics are discarded without current privacy-notice consent',
+    () async {
+      var networkRequests = 0;
+      final database = AppDatabase(NativeDatabase.memory());
+      addTearDown(database.close);
+      await database.incrementDiagnostic(
+        event: 'activityCapture',
+        outcome: 'success',
+        durationBucket: 'notCollected',
+      );
+      final controller = ActivityTrackingController(
+        userId: 'new-user',
+        activities: ActivityRepository(database),
+        categories: CategoryRepository(database),
+        settings: TrackingSettingsRepository(database),
+        insights: InsightRepository(database),
+        sessions: SessionRepository(database),
+        capture: ActivityCaptureService(channel: channel),
+        localAi: FakeLocalAiService(),
+        diagnosticsDatabase: database,
+        diagnostics: DiagnosticsService(
+          client: MockClient((_) async {
+            networkRequests++;
+            return http.Response('', 204);
+          }),
+          endpoint: Uri.https('diagnostics.example', '/v1/health'),
+        ),
+      );
+      addTearDown(controller.dispose);
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'permissionStatus') return 'notDetermined';
+        throw MissingPluginException(call.method);
+      });
+
+      await controller.initialize();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(networkRequests, 0);
+      expect(await database.diagnosticCounters(), isEmpty);
+    },
+  );
+
+  test(
+    'persisted tracking never captures under a stale privacy notice',
+    () async {
+      var snapshotCalls = 0;
+      final database = AppDatabase(NativeDatabase.memory());
+      addTearDown(database.close);
+      await TrackingSettingsRepository(database).save(
+        'returning-user',
+        const TrackingSettings(
+          trackingEnabled: true,
+          onboardingComplete: true,
+          privacyNoticeVersion: 0,
+        ),
+      );
+      messenger.setMockMethodCallHandler(channel, (call) async {
+        return switch (call.method) {
+          'permissionStatus' => 'granted',
+          'getActivitySnapshot' => snapshotCalls++,
+          _ => throw MissingPluginException(call.method),
+        };
+      });
+      final controller = ActivityTrackingController(
+        userId: 'returning-user',
+        activities: ActivityRepository(database),
+        categories: CategoryRepository(database),
+        settings: TrackingSettingsRepository(database),
+        insights: InsightRepository(database),
+        sessions: SessionRepository(database),
+        capture: ActivityCaptureService(channel: channel),
+        localAi: FakeLocalAiService(),
+      );
+      addTearDown(controller.dispose);
+
+      await controller.initialize();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await controller.captureNow();
+
+      expect(snapshotCalls, 0);
+      expect(controller.isActivelyTracking, isFalse);
+      expect(controller.status, ActivityTrackingStatus.disabled);
+    },
+  );
+
+  test('account-deletion suspension rejects later tracking writes', () async {
+    final database = AppDatabase(NativeDatabase.memory());
+    addTearDown(database.close);
+    final settingsRepository = TrackingSettingsRepository(database);
+    await settingsRepository.save(
+      'delete-user',
+      const TrackingSettings(
+        trackingEnabled: true,
+        onboardingComplete: true,
+        privacyNoticeVersion: ActivityTrackingController.privacyNoticeVersion,
+      ),
+    );
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      return switch (call.method) {
+        'permissionStatus' => 'granted',
+        'isLaunchAtLoginEnabled' => false,
+        _ => throw MissingPluginException(call.method),
+      };
+    });
+    final controller = ActivityTrackingController(
+      userId: 'delete-user',
+      activities: ActivityRepository(database),
+      categories: CategoryRepository(database),
+      settings: settingsRepository,
+      insights: InsightRepository(database),
+      sessions: SessionRepository(database),
+      capture: ActivityCaptureService(channel: channel),
+      localAi: FakeLocalAiService(),
+    );
+    addTearDown(controller.dispose);
+    await controller.initialize();
+
+    await controller.suspendForAccountDeletion();
+    await database.deleteUserData('delete-user');
+
+    await expectLater(
+      controller.updateTrackingSettings(const TrackingSettings()),
+      throwsStateError,
+    );
+    final restored = await settingsRepository.get('delete-user');
+    expect(restored.trackingEnabled, isFalse);
+    expect(restored.onboardingComplete, isFalse);
+    expect(controller.status, ActivityTrackingStatus.disabled);
+  });
 }

@@ -7,6 +7,9 @@ import 'package:my_pomodoro_time_management_system/features/timer/timer_controll
 import 'package:my_pomodoro_time_management_system/services/notification_service.dart';
 
 class FakeNotifier implements CompletionNotifier {
+  FakeNotifier({this.throwOnCompletion = false});
+
+  final bool throwOnCompletion;
   int completionCount = 0;
 
   @override
@@ -18,6 +21,7 @@ class FakeNotifier implements CompletionNotifier {
     required bool playSound,
   }) async {
     completionCount++;
+    if (throwOnCompletion) throw StateError('Notification backend failed.');
   }
 }
 
@@ -38,14 +42,15 @@ void main() {
 
   tearDown(() => database.close());
 
-  TimerController createController() => TimerController(
-    userId: 'user-1',
-    database: database,
-    sessions: sessions,
-    settings: settings,
-    notifier: notifier,
-    now: () => now,
-  );
+  TimerController createController({CompletionNotifier? completionNotifier}) =>
+      TimerController(
+        userId: 'user-1',
+        database: database,
+        sessions: sessions,
+        settings: settings,
+        notifier: completionNotifier ?? notifier,
+        now: () => now,
+      );
 
   test(
     'stopping early records actual focus time as a partial session',
@@ -80,6 +85,32 @@ void main() {
 
     await controller.resume();
     expect(controller.remainingSeconds, remainingWhenPaused);
+    controller.dispose();
+  });
+
+  test('partial seconds neither tick early nor inflate stopped time', () async {
+    final controller = createController();
+    await controller.initialize();
+    await controller.startFocus('Measure precisely');
+
+    now = now.add(const Duration(milliseconds: 500));
+    expect(controller.remainingSeconds, 25 * 60);
+    await controller.stop();
+
+    final saved = await database.allSessions('user-1');
+    expect(saved.single.actualSeconds, 0);
+    controller.dispose();
+  });
+
+  test('rejects focus descriptions above the persisted limit', () async {
+    final controller = createController();
+    await controller.initialize();
+
+    await expectLater(
+      controller.startFocus(List.filled(161, 'x').join()),
+      throwsArgumentError,
+    );
+    expect(await database.activeTimer('user-1'), isNull);
     controller.dispose();
   });
 
@@ -135,6 +166,49 @@ void main() {
 
     expect(controller.snapshot.completedFocusesInCycle, 4);
     expect(controller.suggestedPhase, TimerPhase.longBreak);
+    controller.dispose();
+  });
+
+  test('account-deletion suspension blocks later timer writes', () async {
+    final controller = createController();
+    await controller.initialize();
+    await controller.startFocus('Sensitive work');
+
+    await controller.suspendForAccountDeletion();
+    await database.deleteUserData('user-1');
+
+    await expectLater(controller.stop(), throwsStateError);
+    expect(await database.activeTimer('user-1'), isNull);
+    expect(await database.allSessions('user-1'), isEmpty);
+    controller.dispose();
+  });
+
+  test('notification failure does not undo a completed timer', () async {
+    await database.saveTimer(
+      TimerSnapshot(
+        userId: 'user-1',
+        state: TimerRunState.running,
+        phase: TimerPhase.focus,
+        activity: 'Finish safely',
+        cycleId: 'cycle-notification',
+        completedFocusesInCycle: 0,
+        plannedSeconds: 1,
+        accumulatedSeconds: 0,
+        startedAt: now,
+        deadline: now.add(const Duration(seconds: 1)),
+        updatedAt: now,
+      ),
+    );
+    final failingNotifier = FakeNotifier(throwOnCompletion: true);
+    final controller = createController(completionNotifier: failingNotifier);
+    await controller.initialize();
+    now = now.add(const Duration(seconds: 2));
+
+    await Future<void>.delayed(const Duration(milliseconds: 1100));
+
+    expect(controller.snapshot.state, TimerRunState.awaitingNext);
+    expect(failingNotifier.completionCount, 1);
+    expect(await database.allSessions('user-1'), hasLength(1));
     controller.dispose();
   });
 }

@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <flutter/standard_method_codec.h>
@@ -104,6 +106,30 @@ std::wstring ProcessName(DWORD process_id) {
                                          : full_path.substr(separator + 1);
 }
 
+std::optional<bool> CurrentSessionLockState() {
+  LPWSTR state_buffer = nullptr;
+  DWORD byte_count = 0;
+  if (!WTSQuerySessionInformationW(
+          WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx,
+          &state_buffer, &byte_count) ||
+      state_buffer == nullptr ||
+      byte_count < static_cast<DWORD>(sizeof(WTSINFOEXW))) {
+    if (state_buffer != nullptr) {
+      WTSFreeMemory(state_buffer);
+    }
+    return std::nullopt;
+  }
+  const auto* information =
+      reinterpret_cast<const WTSINFOEXW*>(state_buffer);
+  const std::optional<bool> locked = information->Level == 1
+      ? std::optional<bool>(
+            information->Data.WTSInfoExLevel1.SessionFlags !=
+            WTS_SESSIONSTATE_UNLOCK)
+      : std::nullopt;
+  WTSFreeMemory(state_buffer);
+  return locked;
+}
+
 EncodableMap ActivitySnapshot(bool session_locked) {
   LASTINPUTINFO last_input{};
   last_input.cbSize = sizeof(last_input);
@@ -111,7 +137,7 @@ EncodableMap ActivitySnapshot(bool session_locked) {
   const DWORD idle_milliseconds = GetLastInputInfo(&last_input)
       ? GetTickCount() - last_input.dwTime
       : 0;
-  const bool locked = session_locked || IsCurrentSessionLocked();
+  const bool locked = CurrentSessionLockState().value_or(session_locked);
 
   EncodableMap snapshot;
   Put(&snapshot, "capturedAtMilliseconds",
@@ -225,16 +251,23 @@ bool EncodeBitmapAsPng(HBITMAP bitmap, UINT width, UINT height,
   if (FAILED(GetHGlobalFromStream(stream.Get(), &memory)) || memory == nullptr) {
     return false;
   }
-  const SIZE_T size = GlobalSize(memory);
+  STATSTG statistics{};
+  if (FAILED(stream->Stat(&statistics, STATFLAG_NONAME))) {
+    return false;
+  }
+  const ULONGLONG logical_size = statistics.cbSize.QuadPart;
+  const SIZE_T allocation_size = GlobalSize(memory);
+  if (logical_size == 0 || logical_size > allocation_size ||
+      logical_size >
+          static_cast<ULONGLONG>((std::numeric_limits<size_t>::max)())) {
+    return false;
+  }
   const void* bytes = GlobalLock(memory);
-  if (bytes == nullptr || size == 0) {
-    if (bytes != nullptr) {
-      GlobalUnlock(memory);
-    }
+  if (bytes == nullptr) {
     return false;
   }
   const auto* begin = static_cast<const uint8_t*>(bytes);
-  png_bytes->assign(begin, begin + size);
+  png_bytes->assign(begin, begin + static_cast<size_t>(logical_size));
   GlobalUnlock(memory);
   return true;
 }
@@ -296,8 +329,16 @@ std::optional<EncodableList> CaptureAllDisplays() {
   EncodableList captured;
   captured.reserve(displays.size());
   for (const auto& display : displays) {
+    if (CurrentSessionLockState().value_or(true)) {
+      return std::nullopt;
+    }
     EncodableMap payload;
     if (!CaptureDisplay(display, &payload)) {
+      return std::nullopt;
+    }
+    // A lock can occur while BitBlt/WIC is processing a monitor. Throw away
+    // all accumulated byte buffers instead of crossing that privacy boundary.
+    if (CurrentSessionLockState().value_or(true)) {
       return std::nullopt;
     }
     captured.emplace_back(std::move(payload));
@@ -315,12 +356,32 @@ std::wstring CurrentExecutablePath() {
 }
 
 bool IsLaunchAtLoginEnabled() {
-  DWORD type = 0;
   DWORD size = 0;
-  const LSTATUS status = RegGetValueW(
-      HKEY_CURRENT_USER, kRunRegistryKey, kRunValueName, RRF_RT_REG_SZ, &type,
-      nullptr, &size);
-  return status == ERROR_SUCCESS && size > sizeof(wchar_t);
+  if (RegGetValueW(HKEY_CURRENT_USER, kRunRegistryKey, kRunValueName,
+                   RRF_RT_REG_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS ||
+      size <= sizeof(wchar_t) || size % sizeof(wchar_t) != 0) {
+    return false;
+  }
+  std::vector<wchar_t> value(size / sizeof(wchar_t));
+  if (RegGetValueW(HKEY_CURRENT_USER, kRunRegistryKey, kRunValueName,
+                   RRF_RT_REG_SZ, nullptr, value.data(), &size) !=
+      ERROR_SUCCESS) {
+    return false;
+  }
+  const std::wstring executable = CurrentExecutablePath();
+  if (executable.empty()) {
+    return false;
+  }
+  const std::wstring command(value.data());
+  const std::wstring quoted = L"\"" + executable + L"\"";
+  const auto equal_ignoring_case = [](const std::wstring& left,
+                                      const std::wstring& right) {
+    return CompareStringOrdinal(
+               left.c_str(), static_cast<int>(left.size()), right.c_str(),
+               static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
+  };
+  return equal_ignoring_case(command, quoted) ||
+      equal_ignoring_case(command, executable);
 }
 
 bool SetLaunchAtLogin(bool enabled) {
@@ -340,7 +401,7 @@ bool SetLaunchAtLogin(bool enabled) {
       RegCloseKey(key);
       return false;
     }
-    const std::wstring command = L"\\\"" + executable + L"\\\"";
+    const std::wstring command = L"\"" + executable + L"\"";
     status = RegSetValueExW(
         key, kRunValueName, 0, REG_SZ,
         reinterpret_cast<const BYTE*>(command.c_str()),
@@ -358,38 +419,30 @@ bool SetLaunchAtLogin(bool enabled) {
 }  // namespace
 
 bool IsCurrentSessionLocked() {
-  LPWSTR state_buffer = nullptr;
-  DWORD byte_count = 0;
-  if (!WTSQuerySessionInformationW(
-          WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSConnectState,
-          &state_buffer, &byte_count) ||
-      state_buffer == nullptr || byte_count < sizeof(WTS_CONNECTSTATE_CLASS)) {
-    if (state_buffer != nullptr) {
-      WTSFreeMemory(state_buffer);
-    }
-    return GetForegroundWindow() == nullptr;
-  }
-  const auto state = *reinterpret_cast<WTS_CONNECTSTATE_CLASS*>(state_buffer);
-  WTSFreeMemory(state_buffer);
-  return state != WTSActive;
+  return CurrentSessionLockState().value_or(true);
 }
 
 std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
 RegisterActivityCaptureChannel(flutter::BinaryMessenger* messenger,
-                               const bool* session_locked) {
+                               const bool* session_locked,
+                               const bool* capture_exclusion_ready) {
   auto channel =
       std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
           messenger, kActivityCaptureChannel,
           &flutter::StandardMethodCodec::GetInstance());
   channel->SetMethodCallHandler(
-      [session_locked](const auto& call, auto result) {
+      [session_locked, capture_exclusion_ready](const auto& call, auto result) {
         const std::string& method = call.method_name();
         if (method == "permissionStatus") {
-          result->Success(EncodableValue(CaptureConsentStatus()));
+          result->Success(EncodableValue(
+              *capture_exclusion_ready ? CaptureConsentStatus()
+                                       : "restricted"));
           return;
         }
         if (method == "requestPermission") {
-          if (!GrantCaptureConsent()) {
+          if (!*capture_exclusion_ready) {
+            result->Success(EncodableValue("restricted"));
+          } else if (!GrantCaptureConsent()) {
             result->Error("permission-store-failed",
                           "Could not save local activity capture consent.");
           } else {
@@ -403,6 +456,18 @@ RegisterActivityCaptureChannel(flutter::BinaryMessenger* messenger,
           return;
         }
         if (method == "captureDisplays") {
+          if (CurrentSessionLockState().value_or(*session_locked)) {
+            result->Error(
+                "session-locked",
+                "Display capture is unavailable while the session is locked.");
+            return;
+          }
+          if (!*capture_exclusion_ready) {
+            result->Error(
+                "privacy-exclusion-unavailable",
+                "Focus Flow could not exclude its own window from capture.");
+            return;
+          }
           if (CaptureConsentStatus() != "granted") {
             result->Error("permission-denied",
                           "Activity capture consent is required.");
@@ -410,9 +475,15 @@ RegisterActivityCaptureChannel(flutter::BinaryMessenger* messenger,
           }
           auto displays = CaptureAllDisplays();
           if (!displays.has_value()) {
-            result->Error(
-                "capture-failed",
-                "One or more connected displays could not be captured.");
+            if (CurrentSessionLockState().value_or(*session_locked)) {
+              result->Error(
+                  "session-locked",
+                  "Display capture stopped because the session locked.");
+            } else {
+              result->Error(
+                  "capture-failed",
+                  "One or more connected displays could not be captured.");
+            }
           } else {
             result->Success(EncodableValue(std::move(displays.value())));
           }

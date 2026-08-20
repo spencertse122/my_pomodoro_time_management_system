@@ -1,3 +1,4 @@
+import 'package:drift/drift.dart' show Variable;
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:my_pomodoro_time_management_system/data/local/app_database.dart';
@@ -74,6 +75,89 @@ void main() {
     expect(restored.diagnosticsEnabled, isFalse);
     expect(restored.excludedAppIds, ['com.example.private']);
   });
+
+  test(
+    'account deletion clears every user-scoped table only for that user',
+    () async {
+      final now = DateTime.utc(2026, 8, 20, 12);
+      await repository.save(_session('user-one-session', 'user-1', now));
+      await repository.save(_session('user-two-session', 'user-2', now));
+      await database.saveTimer(TimerSnapshot.idle('user-1'));
+      await database.saveSettings('user-1', const PomodoroSettings());
+      final categories = CategoryRepository(database);
+      await categories.ensureDefaults('user-1');
+      final activities = ActivityRepository(database);
+      await activities.saveSample(
+        ActivitySample(
+          id: 'sample-1',
+          userId: 'user-1',
+          capturedAt: now,
+          startedAt: now.subtract(const Duration(minutes: 5)),
+          endedAt: now,
+          appId: 'com.example.private',
+          appName: 'Private app',
+          windowTitle: 'Private title',
+          processingState: ActivityProcessingState.metadataOnly,
+          updatedAt: now,
+        ),
+      );
+      await database.upsertCategoryRule(
+        CategoryRule(
+          id: 'rule-1',
+          userId: 'user-1',
+          appId: 'com.example.private',
+          categoryId: (await categories.get('user-1')).first.id,
+          updatedAt: now,
+        ),
+      );
+      await database.saveDailyInsight(
+        DailyInsight(
+          userId: 'user-1',
+          localDate: now,
+          summary: 'Private summary',
+          patterns: const ['Private pattern'],
+          discrepancies: const [],
+          modelVersion: 'test',
+          promptVersion: 'test',
+          sourceUpdatedAt: now,
+          generatedAt: now,
+        ),
+      );
+      await TrackingSettingsRepository(
+        database,
+      ).save('user-1', const TrackingSettings(onboardingComplete: true));
+      await database.saveLegacyMigrationState(
+        LegacyMigrationState.notStarted('user-1'),
+      );
+
+      await database.deleteUserData('user-1');
+
+      for (final table in const [
+        'session_entries',
+        'timer_entries',
+        'settings_entries',
+        'activity_sample_entries',
+        'activity_block_entries',
+        'category_rule_entries',
+        'category_entries',
+        'daily_insight_entries',
+        'tracking_settings_entries',
+        'migration_state_entries',
+      ]) {
+        final count = await database
+            .customSelect(
+              'SELECT count(*) AS records FROM $table WHERE user_id = ?',
+              variables: const [Variable<String>('user-1')],
+            )
+            .getSingle();
+        expect(count.read<int>('records'), 0, reason: table);
+      }
+      expect(
+        (await database.sessionById('user-two-session'))?.userId,
+        'user-2',
+      );
+    },
+  );
 }
 
 WorkSession _session(String id, String userId, DateTime start) => WorkSession(

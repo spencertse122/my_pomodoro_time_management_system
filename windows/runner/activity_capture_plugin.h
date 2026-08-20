@@ -11,7 +11,8 @@
 // |session_locked| is owned by the runner window and updated from WTS messages.
 std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
 RegisterActivityCaptureChannel(flutter::BinaryMessenger* messenger,
-                               const bool* session_locked);
+                               const bool* session_locked,
+                               const bool* capture_exclusion_ready);
 
 bool IsCurrentSessionLocked();
 

@@ -113,9 +113,28 @@ class AuthService {
     _refreshToken = null;
     _idToken = null;
     _tokenExpiresAt = null;
-    await _database.clearAuth();
-    if (userId != null) await _secureStore?.deleteRefreshToken(userId);
+    Object? cleanupError;
+    StackTrace? cleanupStackTrace;
+    try {
+      await _database.clearAuth();
+    } on Object catch (error, stackTrace) {
+      cleanupError = error;
+      cleanupStackTrace = stackTrace;
+    }
+    if (userId != null) {
+      try {
+        await _secureStore?.deleteRefreshToken(userId);
+      } on Object catch (error, stackTrace) {
+        cleanupError ??= error;
+        cleanupStackTrace ??= stackTrace;
+      }
+    }
+    // Authentication state must leave the signed-in shell even if one local
+    // credential backend reports a cleanup failure.
     _changes.add(null);
+    if (cleanupError != null) {
+      Error.throwWithStackTrace(cleanupError, cleanupStackTrace!);
+    }
   }
 
   Future<void> deleteAccount() async {

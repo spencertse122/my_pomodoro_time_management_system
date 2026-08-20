@@ -69,6 +69,7 @@ class _HomeShellState extends State<HomeShell> {
   late final DesktopTrayService _tray;
   late final Future<void> _initialization;
   int _index = 0;
+  bool _deletingAccount = false;
 
   @override
   void initState() {
@@ -101,7 +102,12 @@ class _HomeShellState extends State<HomeShell> {
 
   Future<void> _initialize() async {
     await Future.wait([_timer.initialize(), _tracking.initialize()]);
-    await _tray.initialize();
+    try {
+      await _tray.initialize();
+    } on Object {
+      // Timer, dashboard, and tracking remain fully usable when the optional
+      // host tray integration is unavailable or blocked by the desktop shell.
+    }
   }
 
   void _trackingChanged() {
@@ -182,7 +188,7 @@ class _HomeShellState extends State<HomeShell> {
         onDeleteAccount: _deleteAccount,
       ),
     ];
-    return Scaffold(
+    final shell = Scaffold(
       body: Row(
         children: [
           NavigationRail(
@@ -252,12 +258,42 @@ class _HomeShellState extends State<HomeShell> {
         ],
       ),
     );
+    if (!_deletingAccount) return shell;
+    return Stack(
+      children: [
+        AbsorbPointer(child: shell),
+        const Positioned.fill(
+          child: ColoredBox(
+            color: Color(0x66000000),
+            child: Center(child: CircularProgressIndicator()),
+          ),
+        ),
+      ],
+    );
   }
 
   Future<void> _deleteAccount() async {
-    await _tracking.disableTracking();
-    await widget.database.deleteUserData(widget.user.uid);
-    await widget.authService.deleteAccount();
+    if (_deletingAccount) return;
+    setState(() => _deletingAccount = true);
+    try {
+      // Purge owner-only legacy documents while the Firebase identity still
+      // exists. Deleting the identity first would orphan that cloud data.
+      await widget.migration.purgeForAccountDeletion(
+        userId: widget.user.uid,
+        confirmedPermanentDeletion: true,
+      );
+      await _tracking.suspendForAccountDeletion();
+      await _timer.suspendForAccountDeletion();
+      await widget.backup.cancelStagedImport();
+      await widget.database.deleteDiagnosticCounters(
+        await widget.database.diagnosticCounters(),
+      );
+      await widget.database.deleteUserData(widget.user.uid);
+      await widget.authService.deleteAccount();
+    } on Object {
+      if (mounted) setState(() => _deletingAccount = false);
+      rethrow;
+    }
   }
 
   String get _trackingStatusLabel => switch (_tracking.status) {

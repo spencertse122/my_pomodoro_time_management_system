@@ -1,3 +1,5 @@
+import 'package:uuid/uuid.dart';
+
 import '../data/local/app_database.dart';
 import '../domain/models.dart';
 import 'firestore_rest_client.dart';
@@ -17,10 +19,12 @@ class LegacyMigrationPreview {
 }
 
 class LegacyCloudMigrationService {
-  LegacyCloudMigrationService(this._database, this._firestore);
+  LegacyCloudMigrationService(this._database, this._firestore, {Uuid? uuid})
+    : _uuid = uuid ?? const Uuid();
 
   final AppDatabase _database;
   final FirestoreRestClient _firestore;
+  final Uuid _uuid;
 
   String _sessionsPath(String userId) => 'users/$userId/sessions';
   String _settingsPath(String userId) => 'users/$userId/settings/pomodoro';
@@ -63,13 +67,18 @@ class LegacyCloudMigrationService {
       var imported = 0;
       await _database.transaction(() async {
         for (final document in remoteSessions) {
-          final session = _sessionFromDocument(document, userId);
+          final storageId = await _availableStorageId(userId, document.id);
+          final session = _sessionFromDocument(
+            document,
+            userId,
+            storageId: storageId,
+          );
           if (session == null) continue;
           if (session.isDeleted) {
-            await _database.hardDeleteSession(session.id);
+            await _database.hardDeleteSessionForUser(userId, session.id);
             continue;
           }
-          final local = await _database.sessionById(session.id);
+          final local = await _database.sessionByIdForUser(userId, session.id);
           if (local == null || !local.updatedAt.isAfter(session.updatedAt)) {
             await _database.upsertSession(session.copyWith(isDirty: false));
             imported++;
@@ -110,26 +119,11 @@ class LegacyCloudMigrationService {
         importedSessionCount: state.importedSessionCount + imported,
       );
       await _database.saveLegacyMigrationState(state);
-      for (final document in remoteSessions) {
-        await _firestore.deleteDocument(
-          '${_sessionsPath(userId)}/${document.id}',
-        );
-      }
-      if (remoteSettings != null) {
-        await _firestore.deleteDocument(_settingsPath(userId));
-      }
-
-      final remainingSessions = await _firestore.listDocuments(
-        _sessionsPath(userId),
+      await _purgeAndVerify(
+        userId,
+        sessions: remoteSessions,
+        settings: remoteSettings,
       );
-      final remainingSettings = await _firestore.getDocument(
-        _settingsPath(userId),
-      );
-      if (remainingSessions.isNotEmpty || remainingSettings != null) {
-        throw const FirestoreException(
-          'Cloud purge verification found remaining legacy data.',
-        );
-      }
       state = state.copyWith(
         state: 'complete',
         cloudVerifiedEmpty: true,
@@ -147,9 +141,71 @@ class LegacyCloudMigrationService {
     }
   }
 
-  WorkSession? _sessionFromDocument(FirestoreDocument document, String userId) {
+  /// Permanently removes legacy cloud data before a Firebase identity is
+  /// deleted. Without this step those owner-only documents would become
+  /// orphaned and impossible for the user to purge later.
+  Future<void> purgeForAccountDeletion({
+    required String userId,
+    required bool confirmedPermanentDeletion,
+  }) async {
+    if (!confirmedPermanentDeletion) {
+      throw ArgumentError(
+        'Permanent account deletion confirmation is required.',
+      );
+    }
+    final sessions = await _firestore.listDocuments(_sessionsPath(userId));
+    final settings = await _firestore.getDocument(_settingsPath(userId));
+    await _purgeAndVerify(userId, sessions: sessions, settings: settings);
+  }
+
+  Future<void> _purgeAndVerify(
+    String userId, {
+    required List<FirestoreDocument> sessions,
+    required FirestoreDocument? settings,
+  }) async {
+    for (final document in sessions) {
+      await _firestore.deleteDocument(
+        '${_sessionsPath(userId)}/${document.id}',
+      );
+    }
+    if (settings != null) {
+      await _firestore.deleteDocument(_settingsPath(userId));
+    }
+
+    final remainingSessions = await _firestore.listDocuments(
+      _sessionsPath(userId),
+    );
+    final remainingSettings = await _firestore.getDocument(
+      _settingsPath(userId),
+    );
+    if (remainingSessions.isNotEmpty || remainingSettings != null) {
+      throw const FirestoreException(
+        'Cloud purge verification found remaining legacy data.',
+      );
+    }
+  }
+
+  Future<String> _availableStorageId(String userId, String remoteId) async {
+    var candidate = remoteId;
+    var attempt = 0;
+    while (true) {
+      final existing = await _database.sessionById(candidate);
+      if (existing == null || existing.userId == userId) return candidate;
+      candidate = _uuid.v5(
+        Namespace.url.value,
+        'focus-flow:legacy-session:$userId:$remoteId:${attempt++}',
+      );
+    }
+  }
+
+  WorkSession? _sessionFromDocument(
+    FirestoreDocument document,
+    String userId, {
+    required String storageId,
+  }) {
     final data = document.fields;
     try {
+      if (document.id.trim().isEmpty || document.id.length > 128) return null;
       final plannedSeconds = (data['plannedSeconds'] as num).toInt();
       final actualSeconds = (data['actualSeconds'] as num).toInt();
       if (plannedSeconds <= 0 ||
@@ -159,16 +215,21 @@ class LegacyCloudMigrationService {
       }
       final activity = data['activity'] as String? ?? '';
       if (activity.length > 160) return null;
+      final cycleId = data['cycleId'] as String? ?? '';
+      if (cycleId.length > 128) return null;
+      final startedAt = _utcFromMilliseconds(data['startedAtMs']);
+      final endedAt = _utcFromMilliseconds(data['endedAtMs']);
+      if (endedAt.isBefore(startedAt)) return null;
       return WorkSession(
-        id: document.id,
+        id: storageId,
         userId: userId,
-        cycleId: data['cycleId'] as String? ?? '',
+        cycleId: cycleId,
         phase: TimerPhase.values.byName(data['phase'] as String),
         activity: activity,
         plannedSeconds: plannedSeconds,
         actualSeconds: actualSeconds,
-        startedAt: _utcFromMilliseconds(data['startedAtMs']),
-        endedAt: _utcFromMilliseconds(data['endedAtMs']),
+        startedAt: startedAt,
+        endedAt: endedAt,
         outcome: SessionOutcome.values.byName(data['outcome'] as String),
         updatedAt: _utcFromMilliseconds(data['updatedAtMs']),
         isDeleted: data['isDeleted'] as bool? ?? false,

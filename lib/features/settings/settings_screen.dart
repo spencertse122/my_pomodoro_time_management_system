@@ -122,6 +122,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final permissionLabel = switch (controller.permission) {
       _ when controller.permission.name == 'granted' => 'Screen access granted',
       _ when controller.permission.name == 'denied' => 'Screen access denied',
+      _ when controller.permission.name == 'restricted' =>
+        'Screen capture blocked by this system',
       _ when controller.permission.name == 'unsupported' =>
         'Screen capture unsupported',
       _ => 'Screen access not requested',
@@ -141,16 +143,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             'Images are analyzed in memory by the local model and never saved.',
           ),
           value: settings.trackingEnabled,
-          onChanged: (value) async {
-            if (value) {
-              final enabled = await controller.enableTracking();
-              if (!enabled && mounted) {
-                _message('Screen access is required for local AI tracking.');
-              }
-            } else {
-              await controller.disableTracking();
-            }
-          },
+          onChanged: _dataBusy ? null : _setTrackingEnabled,
         ),
         const Divider(),
         Text('Capture interval: ${settings.captureIntervalMinutes} minutes'),
@@ -180,13 +173,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
           title: const Text('Launch at login'),
           subtitle: const Text('Tracking still follows the switch above.'),
           value: settings.launchAtLogin,
-          onChanged: (value) => controller.updateTrackingSettings(
-            settings.copyWith(launchAtLogin: value),
-          ),
+          onChanged: _dataBusy ? null : _setLaunchAtLogin,
         ),
         SwitchListTile(
           contentPadding: EdgeInsets.zero,
-          title: const Text('Anonymous health diagnostics'),
+          title: const Text('Aggregate health diagnostics'),
           subtitle: const Text(
             'Sends only bounded success/failure counts when an endpoint is configured.',
           ),
@@ -415,10 +406,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             title: const Text('Delete account and local data'),
             subtitle: const Text(
-              'Permanently deletes the Firebase identity and this account’s encrypted records on this computer.',
+              'Purges legacy cloud records, cancels any staged restore, and permanently deletes the Firebase identity and this account’s encrypted local records.',
             ),
             trailing: TextButton(
-              onPressed: _deleteAccount,
+              onPressed: _dataBusy ? null : _deleteAccount,
               child: const Text('Delete account'),
             ),
           ),
@@ -467,6 +458,46 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (mounted) _message('Pomodoro settings saved.');
     } finally {
       if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  Future<void> _setTrackingEnabled(bool value) async {
+    setState(() => _dataBusy = true);
+    try {
+      if (value) {
+        final enabled = await widget.tracking!.enableTracking();
+        if (!enabled && mounted) {
+          _message('Screen access is required for local AI tracking.');
+        }
+      } else {
+        await widget.tracking!.disableTracking();
+      }
+    } on Object {
+      if (mounted) {
+        _message(
+          'Activity tracking could not be changed. Check system permissions and try again.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _dataBusy = false);
+    }
+  }
+
+  Future<void> _setLaunchAtLogin(bool value) async {
+    setState(() => _dataBusy = true);
+    try {
+      await widget.tracking!.updateTrackingSettings(
+        widget.tracking!.settings.copyWith(launchAtLogin: value),
+      );
+      if (mounted && widget.tracking!.settings.launchAtLogin != value) {
+        _message('The operating system did not accept the login setting.');
+      }
+    } on Object {
+      if (mounted) {
+        _message('Launch at login could not be changed on this computer.');
+      }
+    } finally {
+      if (mounted) setState(() => _dataBusy = false);
     }
   }
 
@@ -631,6 +662,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       await widget.backup!.stageImport(
         sourcePath: source.path,
         passphrase: passphrase,
+        confirmedReplaceAllProfiles: true,
       );
       if (mounted) {
         _message(
@@ -737,7 +769,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       builder: (context) => AlertDialog(
         title: const Text('Permanently delete your account?'),
         content: const Text(
-          'This deletes your Firebase identity and this account’s local history. Export a backup first if needed.',
+          'This purges legacy Firebase data, deletes your Firebase identity and local history, and cancels any pending device-wide restore so it cannot bring the profile back. User-created backup files are not deleted. Export one first if needed.',
         ),
         actions: [
           TextButton(
@@ -751,7 +783,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ],
       ),
     );
-    if (confirmed == true) await widget.onDeleteAccount!();
+    if (confirmed != true) return;
+    setState(() => _dataBusy = true);
+    try {
+      await widget.onDeleteAccount!();
+    } on Object {
+      if (mounted) {
+        _message(
+          'Account deletion could not be fully verified. No success was reported; check your connection and try again.',
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _dataBusy = false);
+    }
   }
 
   Future<String?> _askPassphrase({bool confirm = false}) async {

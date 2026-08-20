@@ -38,6 +38,7 @@ class FlutterWindow : public Win32Window {
 
   bool session_locked_ = false;
   bool session_notifications_registered_ = false;
+  bool capture_exclusion_ready_ = false;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

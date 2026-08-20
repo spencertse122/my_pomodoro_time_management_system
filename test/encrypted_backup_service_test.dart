@@ -76,7 +76,16 @@ void main() {
       await expectLater(
         restoreService.stageImport(
           sourcePath: backup.path,
+          passphrase: passphrase,
+          confirmedReplaceAllProfiles: false,
+        ),
+        throwsArgumentError,
+      );
+      await expectLater(
+        restoreService.stageImport(
+          sourcePath: backup.path,
           passphrase: 'this passphrase is incorrect',
+          confirmedReplaceAllProfiles: true,
         ),
         throwsA(anything),
       );
@@ -95,12 +104,44 @@ void main() {
         restoreService.stageImport(
           sourcePath: incompatible.path,
           passphrase: passphrase,
+          confirmedReplaceAllProfiles: true,
+        ),
+        throwsA(anything),
+      );
+      final malformed = await backup.copy(
+        '${sourceDirectory.path}/malformed.focusflow',
+      );
+      final malformedDatabase = sqlite3.open(malformed.path);
+      try {
+        malformedDatabase.select("PRAGMA cipher = 'sqlcipher';");
+        malformedDatabase.select("PRAGMA key = '$passphrase';");
+        malformedDatabase.execute('DROP TABLE category_entries;');
+      } finally {
+        malformedDatabase.close();
+      }
+      await expectLater(
+        restoreService.stageImport(
+          sourcePath: malformed.path,
+          passphrase: passphrase,
+          confirmedReplaceAllProfiles: true,
         ),
         throwsA(anything),
       );
       await restoreService.stageImport(
         sourcePath: backup.path,
         passphrase: passphrase,
+        confirmedReplaceAllProfiles: true,
+      );
+      final staged = File(
+        '${restoreDirectory.path}/${EncryptedDatabase.pendingRestoreFileName}',
+      );
+      expect(staged.existsSync(), isTrue);
+      await restoreService.cancelStagedImport();
+      expect(staged.existsSync(), isFalse);
+      await restoreService.stageImport(
+        sourcePath: backup.path,
+        passphrase: passphrase,
+        confirmedReplaceAllProfiles: true,
       );
       await restoreDatabase.close();
 
@@ -178,4 +219,52 @@ void main() {
       }
     },
   );
+
+  test('recovers an interrupted restore from its encrypted rollback', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'focus-flow-rollback-',
+    );
+    addTearDown(() => directory.delete(recursive: true));
+    const key = 'rollback-machine-key-000000000000000000000';
+    final database = await EncryptedDatabase.open(
+      key,
+      applicationDirectory: directory,
+    );
+    final now = DateTime.now().toUtc();
+    await SessionRepository(database).save(
+      WorkSession(
+        id: 'rollback-session',
+        userId: 'user',
+        cycleId: 'cycle',
+        phase: TimerPhase.focus,
+        activity: 'Recover me',
+        plannedSeconds: 1500,
+        actualSeconds: 1500,
+        startedAt: now.subtract(const Duration(minutes: 25)),
+        endedAt: now,
+        outcome: SessionOutcome.completed,
+        updatedAt: now,
+      ),
+    );
+    await database.customStatement('PRAGMA wal_checkpoint(TRUNCATE);');
+    await database.close();
+
+    final encrypted = File(
+      '${directory.path}/${EncryptedDatabase.databaseFileName}',
+    );
+    final rollback = await encrypted.copy('${encrypted.path}.before-restore');
+    await encrypted.writeAsBytes(const [1, 2, 3, 4], flush: true);
+
+    final recovered = await EncryptedDatabase.open(
+      key,
+      applicationDirectory: directory,
+    );
+    addTearDown(recovered.close);
+
+    expect(
+      (await recovered.sessionById('rollback-session'))?.activity,
+      'Recover me',
+    );
+    expect(rollback.existsSync(), isFalse);
+  });
 }

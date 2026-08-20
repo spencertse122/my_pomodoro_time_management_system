@@ -39,9 +39,12 @@ class EncryptedDatabase {
     final legacy = File(p.join(legacyDirectory.path, legacyDatabaseFileName));
     final encrypted = File(p.join(directory.path, databaseFileName));
     final pendingRestore = File(p.join(directory.path, pendingRestoreFileName));
+    final restoreRollback = File('${encrypted.path}.before-restore');
 
     if (await pendingRestore.exists()) {
       await _applyPendingRestore(pendingRestore, encrypted, key);
+    } else if (await restoreRollback.exists()) {
+      await _recoverInterruptedRestore(restoreRollback, encrypted, key);
     }
 
     if (!await encrypted.exists() && await legacy.exists()) {
@@ -72,7 +75,25 @@ class EncryptedDatabase {
     // Once the encrypted database has been reopened and verified, finish the
     // cleanup on the next launch.
     if (await legacy.exists()) await _deleteDatabaseAndSidecars(legacy);
+    // A process termination after a restored database was verified but before
+    // its rollback file was removed must not leave a second copy indefinitely.
+    if (await restoreRollback.exists()) {
+      await _deleteDatabaseAndSidecars(restoreRollback);
+    }
     return database;
+  }
+
+  static Future<void> _recoverInterruptedRestore(
+    File rollback,
+    File encrypted,
+    String key,
+  ) async {
+    _verifyEncryptedFile(rollback, key);
+    // The previous launch did not reach the post-Drift-open cleanup. Raw
+    // SQLite integrity is insufficient proof that a restored schema can be
+    // opened by this release, so return to the last known-good database.
+    if (await encrypted.exists()) await _deleteDatabaseAndSidecars(encrypted);
+    await rollback.rename(encrypted.path);
   }
 
   static Future<void> _applyPendingRestore(
@@ -101,7 +122,8 @@ class EncryptedDatabase {
       } finally {
         restored.close();
       }
-      await _deleteDatabaseAndSidecars(rollback);
+      // Keep the rollback until AppDatabase has opened and run any required
+      // schema migration. [open] removes it only after that stronger check.
     } on Object {
       if (await encrypted.exists()) await _deleteDatabaseAndSidecars(encrypted);
       if (await rollback.exists()) await rollback.rename(encrypted.path);
@@ -118,32 +140,25 @@ class EncryptedDatabase {
     await _deleteDatabaseAndSidecars(temporary);
 
     final source = sqlite3.open(legacy.path);
+    Database? target;
     late final Map<String, int> sourceCounts;
     try {
       _verifyReadable(source);
       source.execute('PRAGMA wal_checkpoint(TRUNCATE);');
       source.execute('PRAGMA journal_mode = DELETE;');
       sourceCounts = _tableCounts(source);
-      source.execute("VACUUM INTO '${_escapeSql(temporary.path)}';");
+      // Key the destination before copying any pages. The partial file is
+      // therefore encrypted even if the process terminates mid-migration.
+      target = sqlite3.open(temporary.path);
+      _applyKey(target, key);
+      _copyDatabaseContents(source, target);
     } finally {
+      target?.close();
       source.close();
     }
 
-    final target = sqlite3.open(temporary.path);
-    try {
-      _selectCipher(target);
-      final result = target.select("PRAGMA rekey = '${_escapeSql(key)}';");
-      if (!_pragmaSucceeded(result)) {
-        throw StateError(
-          'The sqlite3mc encryption runtime rejected the database key.',
-        );
-      }
-    } finally {
-      target.close();
-    }
-
-    // Reopen with the key. This proves the file is encrypted with the expected
-    // scheme rather than merely trusting PRAGMA rekey's return value.
+    // Reopen with the key. This proves both encryption and the generic schema
+    // copy before the new file is atomically promoted.
     final verification = sqlite3.open(temporary.path);
     try {
       _applyKey(verification, key);
@@ -187,6 +202,78 @@ class EncryptedDatabase {
     final integrity = database.select('PRAGMA integrity_check;');
     if (integrity.isEmpty || integrity.first.values.first != 'ok') {
       throw StateError('Database integrity verification failed.');
+    }
+  }
+
+  static void _verifyEncryptedFile(File file, String key) {
+    final database = sqlite3.open(file.path);
+    try {
+      _applyKey(database, key);
+      _verifyReadable(database);
+    } finally {
+      database.close();
+    }
+  }
+
+  static void _copyDatabaseContents(Database source, Database target) {
+    final tables = source.select(
+      "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+      "AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL ORDER BY rowid",
+    );
+    final trailingSchema = source.select(
+      "SELECT sql FROM sqlite_master WHERE type IN ('index', 'trigger', 'view') "
+      "AND sql IS NOT NULL ORDER BY CASE type "
+      "WHEN 'index' THEN 0 WHEN 'trigger' THEN 1 ELSE 2 END, rowid",
+    );
+    final userVersion = source
+        .select('PRAGMA user_version;')
+        .first
+        .values
+        .first;
+    final applicationId = source
+        .select('PRAGMA application_id;')
+        .first
+        .values
+        .first;
+
+    target.execute('BEGIN IMMEDIATE;');
+    try {
+      for (final table in tables) {
+        target.execute(table['sql'] as String);
+      }
+      for (final table in tables) {
+        final name = table['name'] as String;
+        final rows = source.select(
+          'SELECT * FROM "${_escapeIdentifier(name)}";',
+        );
+        if (rows.columnNames.isEmpty) continue;
+        final columns = rows.columnNames
+            .map((column) => '"${_escapeIdentifier(column)}"')
+            .join(', ');
+        final placeholders = List.filled(
+          rows.columnNames.length,
+          '?',
+        ).join(', ');
+        final insert =
+            'INSERT INTO "${_escapeIdentifier(name)}" ($columns) '
+            'VALUES ($placeholders);';
+        for (final row in rows) {
+          target.execute(insert, row.values);
+        }
+      }
+      for (final schemaEntry in trailingSchema) {
+        target.execute(schemaEntry['sql'] as String);
+      }
+      target.execute('PRAGMA user_version = $userVersion;');
+      target.execute('PRAGMA application_id = $applicationId;');
+      target.execute('COMMIT;');
+    } on Object catch (error, stackTrace) {
+      try {
+        target.execute('ROLLBACK;');
+      } on Object {
+        // Preserve the copy failure that caused the rollback.
+      }
+      Error.throwWithStackTrace(error, stackTrace);
     }
   }
 
