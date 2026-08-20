@@ -1,8 +1,14 @@
 #include "flutter_window.h"
 
 #include <optional>
+#include <wtsapi32.h>
 
+#include "activity_capture_plugin.h"
 #include "flutter/generated_plugin_registrant.h"
+
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
 
 FlutterWindow::FlutterWindow(const flutter::DartProject& project)
     : project_(project) {}
@@ -25,6 +31,15 @@ bool FlutterWindow::OnCreate() {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  session_locked_ = IsCurrentSessionLocked();
+  activity_capture_channel_ = RegisterActivityCaptureChannel(
+      flutter_controller_->engine()->messenger(), &session_locked_);
+  session_notifications_registered_ =
+      WTSRegisterSessionNotification(GetHandle(), NOTIFY_FOR_THIS_SESSION) ==
+      TRUE;
+  // Prevent Focus Flow's own window (which can show private history or backup
+  // controls) from appearing in display captures on supported Windows builds.
+  SetWindowDisplayAffinity(GetHandle(), WDA_EXCLUDEFROMCAPTURE);
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
@@ -40,6 +55,11 @@ bool FlutterWindow::OnCreate() {
 }
 
 void FlutterWindow::OnDestroy() {
+  if (session_notifications_registered_) {
+    WTSUnRegisterSessionNotification(GetHandle());
+    session_notifications_registered_ = false;
+  }
+  activity_capture_channel_.reset();
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
   }
@@ -62,6 +82,13 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   }
 
   switch (message) {
+    case WM_WTSSESSION_CHANGE:
+      if (wparam == WTS_SESSION_LOCK) {
+        session_locked_ = true;
+      } else if (wparam == WTS_SESSION_UNLOCK) {
+        session_locked_ = false;
+      }
+      break;
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
       break;

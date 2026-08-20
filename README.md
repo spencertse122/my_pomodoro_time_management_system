@@ -1,88 +1,110 @@
-# Focus Flow
+# Focus Flow v2
 
-Focus Flow is a local-first Pomodoro desktop app for macOS and Windows. Describe
-your work, run configurable focus and break phases, and review a daily timeline
-of completed and partial intervals. SQLite is the on-device source of truth;
-Firebase Authentication and Cloud Firestore provide account ownership and sync.
+Focus Flow is a privacy-first Pomodoro and activity-awareness desktop app for
+macOS and Windows. It combines an intentional Pomodoro lane with an observed
+activity lane, then uses a bundled Gemma vision model to classify activity and
+generate daily summaries entirely on the user's machine.
 
-## MVP features
+## Privacy guarantees
 
-- Email/password account creation, sign-in, password reset, and sign-out.
-- Classic 25/5/15 Pomodoro cycle with a long break after four focuses.
-- Configurable durations, long-break interval, and completion sound.
-- Pause/resume, partial-session saving, and timestamp-based restart recovery.
-- Native desktop completion notification plus a short generated completion tone.
-- Local-first Drift/SQLite storage with queued, idempotent Firestore sync.
-- Daily focus/break totals, completed Pomodoros, partial focus time, and timeline.
-- Date navigation, activity-label correction, and synchronized tombstone deletion.
+- Personal activity data is stored only in a local SQLCipher-compatible
+  `sqlite3mc` database. Its random key is held by Keychain on macOS or Windows
+  Credential Manager.
+- Screenshots are captured only after explicit consent, passed from native
+  memory directly to local inference, and never written to disk, the database,
+  logs, backups, diagnostics, Firebase, or another network service.
+- Firebase is used for authentication only. Routine Firestore synchronization
+  has been removed. Firestore access exists only in the explicit, one-time
+  legacy import-and-purge tool.
+- Tracking pauses for a locked session or configurable idle period. Users can
+  pause/disable tracking, exclude apps, retag classifications, and disable
+  aggregate diagnostics.
 
-Passive screen-time collection, system-tray operation, charts, tags, and automatic
-phase starts are intentionally outside this first release.
+The complete boundary and data inventory are in [docs/privacy.md](docs/privacy.md)
+and [docs/architecture.md](docs/architecture.md).
 
-## Prerequisites
+## Product behavior
 
-- Flutter 3.41.1 or newer with macOS and/or Windows desktop support enabled.
-- Xcode for macOS builds; Visual Studio with Desktop development with C++ for
-  Windows builds.
-- The checked-in app is already connected to the Firebase project
-  `focus-flow-spencertse`. Firebase configuration identifiers are not secrets;
-  account access and data isolation are enforced by Authentication and the
-  deployed Firestore security rules.
+- Native foreground-app, active-window, idle, and lock-state observation.
+- Explicit screen-recording permission and in-memory capture of every connected
+  display for local Gemma 3 multimodal analysis.
+- Editable categories, including Learning, Work, Miscellaneous, Time wasted,
+  and Casual browsing; low-confidence output remains visible for review.
+- Daily observed-activity totals kept separate from Pomodoro intentions so the
+  same time is never double-counted.
+- Manual retagging, optional per-app rules, app exclusions, metadata-only
+  degradation, daily local-AI insight, system tray operation, and launch at
+  login.
+- User-initiated passphrase-encrypted backup/restore and an explicit legacy
+  Firestore migration with preview, import confirmation, purge confirmation,
+  and cloud-empty verification.
 
-## Firebase setup
+An encrypted backup contains all Focus Flow profiles stored on that computer;
+the export dialog makes this device-wide scope explicit.
 
-Firebase project creation, the macOS and Windows app registrations,
-Email/Password Authentication, and the Firestore database in
-`asia-southeast1` have already been provisioned. To redeploy the checked-in
-configuration and security rules after changing them:
+## Supported release targets
 
-```sh
-firebase login
-firebase use focus-flow-spencertse
-firebase deploy --only auth,firestore:rules
-```
+- macOS 13 or newer on Apple Silicon.
+- Windows 11 x64.
+- 16 GB RAM is recommended for the bundled Gemma 3 4B Q4 model.
 
-Platform identifiers live in `lib/core/firebase_config.dart`. Focus Flow uses
-Firebase's authenticated REST APIs so a personal macOS build does not require an
-Apple Developer signing certificate. The refresh token is stored in the local
-SQLite database; Firestore requests use short-lived Firebase ID tokens and are
-still evaluated by the deployed security rules.
+Linux is not a v2 release target. Physical macOS/Windows permission behavior,
+GPU/CPU performance, signing, notarization, and installer verification must be
+validated on their target hosts; see [docs/release.md](docs/release.md) and
+[docs/limitations.md](docs/limitations.md).
 
-## Development commands
+## Development
+
+Install Flutter 3.47.1, Xcode 15+ for macOS, or Visual Studio 2022 with Desktop
+development with C++ for Windows. Then run:
 
 ```sh
 flutter pub get
 dart run build_runner build
+dart format --output=none --set-exit-if-changed lib test integration_test tool
+flutter analyze
+flutter test
 flutter run -d macos
-# Run the equivalent command on a Windows host:
+# On a Windows host:
 flutter run -d windows
 ```
 
-## Use the app
+Development builds work without model weights and show a local-model-missing
+state. To exercise AI, put these files in `assets/models/` before building, or
+provide absolute paths with `FOCUS_FLOW_MODEL_PATH` and
+`FOCUS_FLOW_MMPROJ_PATH` as compile-time defines:
 
-After a release build, open the macOS app directly:
+- `gemma-3-4b-it-q4_k_m.gguf`
+- `mmproj-gemma-3-4b-it-f16.gguf`
 
-```sh
-open "build/macos/Build/Products/Release/Focus Flow.app"
-```
-
-On first launch, create an account with your email and a password of at least
-six characters. Enter the work you are doing, start the focus timer, and use
-the **Day** view to review, rename, or remove tracked intervals. Settings are
-available from the left navigation rail.
-
-## Validation and builds
+Weights are intentionally gitignored. Obtain them from an authorized source,
+accept the [Gemma Terms of Use](https://ai.google.dev/gemma/terms), and verify
+their release-pinned SHA-256 values:
 
 ```sh
-dart format --output=none --set-exit-if-changed lib test integration_test
-flutter analyze
-flutter test
-flutter build macos
-# Must run on Windows:
-flutter build windows
+GEMMA_MODEL_SHA256=<64 hex characters> \
+GEMMA_MMPROJ_SHA256=<64 hex characters> \
+dart run tool/verify_models.dart
 ```
 
-The real-backend integration test requires a temporary Firebase test account:
+## Firebase boundary
+
+The checked-in Firebase configuration contains public application identifiers,
+not credentials. Email/password authentication supports account creation,
+sign-in, password reset, refresh, sign-out, and deletion. The refresh token is
+stored in the OS secure store, not in the database.
+
+Deploy the v2 rules before offering legacy cleanup. They permit an authenticated
+owner to read/delete only their old session/settings documents and reject all
+creates and updates:
+
+```sh
+firebase login
+firebase use focus-flow-spencertse
+firebase deploy --only firestore:rules
+```
+
+The optional real-auth integration test requires a disposable Firebase account:
 
 ```sh
 flutter test integration_test/app_flow_test.dart \
@@ -90,30 +112,28 @@ flutter test integration_test/app_flow_test.dart \
   --dart-define=TEST_PASSWORD=...
 ```
 
-Run the Firebase emulators for manual rules testing with:
+## Release configuration
 
-```sh
-firebase emulators:start --only auth,firestore
-```
+The signed release workflow downloads model artifacts from protected URLs,
+checks their SHA-256 digests, builds target-native packages, and signs/notarizes
+them. It requires self-hosted Apple Silicon macOS and Windows x64 runners plus
+the secrets and variables documented in [docs/release.md](docs/release.md).
 
-## Data and recovery behavior
+Optional endpoints are compile-time only:
 
-Each account has local session, settings, and active-timer records. A finished
-session is first committed to SQLite and marked dirty; synchronization writes it
-to `users/{uid}/sessions/{sessionId}` and clears the dirty flag. Offline edits and
-deletions use the same queue. Deletes remain tombstones so another installation
-does not restore removed history.
-
-If the app reopens while a running phase still has time remaining, the countdown
-is reconstructed from its UTC deadline. If the deadline passed, the phase is
-recorded once at its scheduled end and the app waits for the user to start the
-next phase. Paused timers remain paused. Active timers are device-local and are
-not handed off between computers.
+- `FOCUS_FLOW_DIAGNOSTICS_URL`: HTTPS endpoint accepting only the documented
+  coarse health-counter schema. With no value, no diagnostics request is made.
+- `FOCUS_FLOW_UPDATE_FEED_URL`: HTTPS JSON feed pointing to signed installers.
+  With no value, update checking reports that it is not configured.
 
 ## Project structure
 
-- `lib/features/` contains authentication, timer, dashboard, and settings UI.
-- `lib/domain/` contains timer/session/settings types.
-- `lib/data/` contains Drift persistence, repositories, and Firestore sync.
-- `lib/services/` contains authentication and desktop notification adapters.
-- `test/` mirrors critical timer and persistence behavior.
+- `lib/features/` contains authentication, onboarding, timer, tracking,
+  dashboard, and settings UI/controllers.
+- `lib/data/` contains encrypted local repositories and the isolated legacy
+  migration boundary.
+- `lib/services/` contains local inference, native capture, secure storage,
+  backups, authentication, diagnostics, and update adapters.
+- `macos/Runner/` and `windows/runner/` contain the platform capture channels.
+- `test/` covers domain, privacy-boundary, database, AI, capture, and UI behavior.
+- `docs/` and `packaging/` contain operational documentation and installers.

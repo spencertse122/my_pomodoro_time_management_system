@@ -33,6 +33,13 @@ migrate_working_dir/
 /build/
 /coverage/
 
+# Local/release-only AI model artifacts are multi-gigabyte licensed binaries.
+# Release builds stage verified copies into the installer instead of Git.
+/assets/models/*.gguf
+/assets/models/*.litertlm
+/assets/models/*.partial
+/release-secrets/
+
 # Symbolication related
 app.*.symbols
 

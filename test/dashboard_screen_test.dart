@@ -61,7 +61,7 @@ void main() {
     expect(find.text('Edited label'), findsNothing);
 
     final deleted = await database.sessionById('dashboard-session');
-    expect(deleted?.isDeleted, isTrue);
+    expect(deleted, isNull);
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(milliseconds: 1));

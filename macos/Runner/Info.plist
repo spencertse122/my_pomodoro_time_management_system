@@ -21,7 +21,9 @@
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+	<string>13.0</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Focus Flow captures your displays only after you opt in, analyzes each image locally, and never saves the image to disk.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>$(PRODUCT_COPYRIGHT)</string>
 	<key>NSMainNibFile</key>

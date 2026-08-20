@@ -1,0 +1,120 @@
+name: Signed desktop release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semver release version
+        required: true
+        default: 2.0.0
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    runs-on: [self-hosted, macOS, ARM64]
+    env:
+      GEMMA_MODEL_SHA256: ${{ secrets.GEMMA_MODEL_SHA256 }}
+      GEMMA_MMPROJ_SHA256: ${{ secrets.GEMMA_MMPROJ_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.1
+          channel: stable
+      - run: flutter pub get
+      - name: Stage verified Gemma release assets
+        env:
+          GEMMA_MODEL_URL: ${{ secrets.GEMMA_MODEL_URL }}
+          GEMMA_MMPROJ_URL: ${{ secrets.GEMMA_MMPROJ_URL }}
+        run: |
+          curl --fail --location "$GEMMA_MODEL_URL" --output assets/models/gemma-3-4b-it-q4_k_m.gguf
+          curl --fail --location "$GEMMA_MMPROJ_URL" --output assets/models/mmproj-gemma-3-4b-it-f16.gguf
+          dart run tool/verify_models.dart
+      - run: dart run build_runner build
+      - run: dart format --output=none --set-exit-if-changed lib test integration_test tool
+      - run: flutter analyze
+      - run: flutter test
+      - name: Build Apple Silicon app
+        run: >-
+          flutter build macos --release
+          --build-name=${{ inputs.version }}
+          --dart-define="FOCUS_FLOW_UPDATE_FEED_URL=${{ vars.FOCUS_FLOW_UPDATE_FEED_URL }}"
+          --dart-define="FOCUS_FLOW_DIAGNOSTICS_URL=${{ vars.FOCUS_FLOW_DIAGNOSTICS_URL }}"
+      - name: Sign, notarize, and package DMG
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          APP_PATH="build/macos/Build/Products/Release/Focus Flow.app"
+          DIST_PATH="$RUNNER_TEMP/focus-flow-dist"
+          mkdir -p "$DIST_PATH"
+          codesign --deep --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          hdiutil create -volname "Focus Flow" -srcfolder "$APP_PATH" -ov -format UDZO "$DIST_PATH/Focus-Flow-${{ inputs.version }}-macos-arm64.dmg"
+          codesign --force --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$DIST_PATH/Focus-Flow-${{ inputs.version }}-macos-arm64.dmg"
+          xcrun notarytool submit "$DIST_PATH/Focus-Flow-${{ inputs.version }}-macos-arm64.dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$DIST_PATH/Focus-Flow-${{ inputs.version }}-macos-arm64.dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DIST_PATH/Focus-Flow-${{ inputs.version }}-macos-arm64.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: focus-flow-${{ inputs.version }}-macos-arm64
+          path: ${{ runner.temp }}/focus-flow-dist/*.dmg
+          if-no-files-found: error
+
+  windows-x64:
+    runs-on: [self-hosted, Windows, X64]
+    env:
+      GEMMA_MODEL_SHA256: ${{ secrets.GEMMA_MODEL_SHA256 }}
+      GEMMA_MMPROJ_SHA256: ${{ secrets.GEMMA_MMPROJ_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.1
+          channel: stable
+      - run: flutter pub get
+      - name: Stage verified Gemma release assets
+        shell: pwsh
+        env:
+          GEMMA_MODEL_URL: ${{ secrets.GEMMA_MODEL_URL }}
+          GEMMA_MMPROJ_URL: ${{ secrets.GEMMA_MMPROJ_URL }}
+        run: |
+          Invoke-WebRequest $env:GEMMA_MODEL_URL -OutFile assets/models/gemma-3-4b-it-q4_k_m.gguf
+          Invoke-WebRequest $env:GEMMA_MMPROJ_URL -OutFile assets/models/mmproj-gemma-3-4b-it-f16.gguf
+          dart run tool/verify_models.dart
+      - run: dart run build_runner build
+      - run: dart format --output=none --set-exit-if-changed lib test integration_test tool
+      - run: flutter analyze
+      - run: flutter test
+      - name: Build Windows x64 application
+        run: >-
+          flutter build windows --release
+          --build-name=${{ inputs.version }}
+          --dart-define="FOCUS_FLOW_UPDATE_FEED_URL=${{ vars.FOCUS_FLOW_UPDATE_FEED_URL }}"
+          --dart-define="FOCUS_FLOW_DIAGNOSTICS_URL=${{ vars.FOCUS_FLOW_DIAGNOSTICS_URL }}"
+      - name: Import signing certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          New-Item -ItemType Directory -Force release-secrets | Out-Null
+          [IO.File]::WriteAllBytes('release-secrets/windows-signing.pfx', [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
+      - name: Sign executable and build signed installer
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          signtool.exe sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f release-secrets/windows-signing.pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD build/windows/x64/runner/Release/FocusFlow.exe
+          $env:PATH = "C:\Program Files (x86)\Inno Setup 6;$env:PATH"
+          ISCC.exe "/DMyAppVersion=${{ inputs.version }}" "/SFocusFlowSignTool=packaging\windows\sign-file.cmd `$f" packaging/windows/FocusFlow.iss
+          signtool.exe verify /pa /all dist/Focus-Flow-${{ inputs.version }}-windows-x64-setup.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: focus-flow-${{ inputs.version }}-windows-x64
+          path: dist/*.exe
+          if-no-files-found: error

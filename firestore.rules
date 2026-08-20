@@ -7,39 +7,15 @@ service cloud.firestore {
     }
 
     match /users/{userId}/sessions/{sessionId} {
-      allow read: if owns(userId);
-      allow create, update: if owns(userId)
-        && request.resource.data.userId == userId
-        && request.resource.data.id == sessionId
-        && request.resource.data.phase in ['focus', 'shortBreak', 'longBreak']
-        && request.resource.data.outcome in ['completed', 'stopped']
-        && request.resource.data.activity is string
-        && request.resource.data.activity.size() <= 160
-        && request.resource.data.plannedSeconds is int
-        && request.resource.data.actualSeconds is int
-        && request.resource.data.plannedSeconds > 0
-        && request.resource.data.actualSeconds >= 0
-        && request.resource.data.actualSeconds <= request.resource.data.plannedSeconds;
-      allow delete: if false;
+      // v2 may only read old records and permanently purge them. No client can
+      // create or update activity data in Firestore.
+      allow read, delete: if owns(userId);
+      allow create, update: if false;
     }
 
     match /users/{userId}/settings/pomodoro {
-      allow read: if owns(userId);
-      allow create, update: if owns(userId)
-        && request.resource.data.focusMinutes is int
-        && request.resource.data.focusMinutes >= 1
-        && request.resource.data.focusMinutes <= 180
-        && request.resource.data.shortBreakMinutes is int
-        && request.resource.data.shortBreakMinutes >= 1
-        && request.resource.data.shortBreakMinutes <= 180
-        && request.resource.data.longBreakMinutes is int
-        && request.resource.data.longBreakMinutes >= 1
-        && request.resource.data.longBreakMinutes <= 180
-        && request.resource.data.longBreakInterval is int
-        && request.resource.data.longBreakInterval >= 2
-        && request.resource.data.longBreakInterval <= 12
-        && request.resource.data.soundEnabled is bool;
-      allow delete: if false;
+      allow read, delete: if owns(userId);
+      allow create, update: if false;
     }
   }
 }

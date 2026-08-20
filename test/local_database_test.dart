@@ -1,6 +1,7 @@
 import 'package:drift/native.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:my_pomodoro_time_management_system/data/local/app_database.dart';
+import 'package:my_pomodoro_time_management_system/data/activity_repository.dart';
 import 'package:my_pomodoro_time_management_system/data/session_repository.dart';
 import 'package:my_pomodoro_time_management_system/domain/models.dart';
 
@@ -28,7 +29,7 @@ void main() {
   });
 
   test(
-    'editing keeps timestamps immutable and deletion is a tombstone',
+    'editing keeps timestamps immutable and deletion removes local data',
     () async {
       final original = _session('one', 'user-1', DateTime.now().toUtc());
       await repository.save(original);
@@ -47,10 +48,32 @@ void main() {
 
       await repository.delete(edited);
       final deleted = await database.sessionById('one');
-      expect(deleted!.isDeleted, isTrue);
-      expect(deleted.isDirty, isTrue);
+      expect(deleted, isNull);
     },
   );
+
+  test('privacy onboarding and tracking controls persist locally', () async {
+    final tracking = TrackingSettingsRepository(database);
+    const settings = TrackingSettings(
+      trackingEnabled: true,
+      captureIntervalMinutes: 7,
+      idleThresholdMinutes: 9,
+      onboardingComplete: true,
+      privacyNoticeVersion: 1,
+      diagnosticsEnabled: false,
+      excludedAppIds: ['com.example.private'],
+    );
+
+    await tracking.save('user-1', settings);
+    final restored = await tracking.get('user-1');
+
+    expect(restored.trackingEnabled, isTrue);
+    expect(restored.captureIntervalMinutes, 7);
+    expect(restored.onboardingComplete, isTrue);
+    expect(restored.privacyNoticeVersion, 1);
+    expect(restored.diagnosticsEnabled, isFalse);
+    expect(restored.excludedAppIds, ['com.example.private']);
+  });
 }
 
 WorkSession _session(String id, String userId, DateTime start) => WorkSession(

@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../data/local/app_database.dart';
+import 'secure_store.dart';
 
 class AppUser {
   const AppUser({required this.uid, required this.email});
@@ -26,13 +27,16 @@ class AuthService {
     required AppDatabase database,
     required String apiKey,
     required http.Client client,
+    SecureStore? secureStore,
   }) : _database = database,
        _apiKey = apiKey,
-       _client = client;
+       _client = client,
+       _secureStore = secureStore;
 
   final AppDatabase _database;
   final String _apiKey;
   final http.Client _client;
+  final SecureStore? _secureStore;
   final StreamController<AppUser?> _changes = StreamController.broadcast();
 
   AppUser? _currentUser;
@@ -45,16 +49,28 @@ class AuthService {
     required AppDatabase database,
     required String apiKey,
     http.Client? client,
+    SecureStore? secureStore,
   }) async {
     final service = AuthService._(
       database: database,
       apiKey: apiKey,
       client: client ?? http.Client(),
+      secureStore: secureStore,
     );
     final stored = await database.storedAuth();
     if (stored != null) {
-      service._currentUser = AppUser(uid: stored.userId, email: stored.email);
-      service._refreshToken = stored.refreshToken;
+      final secureToken = await secureStore?.refreshToken(stored.userId);
+      final token = secureToken ?? stored.refreshToken;
+      if (token.isNotEmpty) {
+        service._currentUser = AppUser(uid: stored.userId, email: stored.email);
+        service._refreshToken = token;
+        if (secureStore != null && secureToken == null) {
+          await secureStore.saveRefreshToken(stored.userId, token);
+          await database.saveAuth(
+            StoredAuth(userId: stored.userId, email: stored.email),
+          );
+        }
+      }
     }
     return service;
   }
@@ -92,12 +108,20 @@ class AuthService {
   }
 
   Future<void> signOut() async {
+    final userId = _currentUser?.uid;
     _currentUser = null;
     _refreshToken = null;
     _idToken = null;
     _tokenExpiresAt = null;
     await _database.clearAuth();
+    if (userId != null) await _secureStore?.deleteRefreshToken(userId);
     _changes.add(null);
+  }
+
+  Future<void> deleteAccount() async {
+    final token = await idToken();
+    await _identityRequest('accounts:delete', {'idToken': token});
+    await signOut();
   }
 
   Future<String> idToken({bool forceRefresh = false}) async {
@@ -166,8 +190,13 @@ class AuthService {
     _refreshToken = refreshToken;
     _idToken = idToken;
     _setExpiration(data['expiresIn']);
+    await _secureStore?.saveRefreshToken(userId, refreshToken);
     await _database.saveAuth(
-      StoredAuth(userId: userId, email: email, refreshToken: refreshToken),
+      StoredAuth(
+        userId: userId,
+        email: email,
+        refreshToken: _secureStore == null ? refreshToken : '',
+      ),
     );
     _changes.add(_currentUser);
   }
@@ -200,11 +229,12 @@ class AuthService {
       _refreshToken = replacementRefreshToken;
       _setExpiration(data['expires_in']);
       final user = _currentUser!;
+      await _secureStore?.saveRefreshToken(user.uid, replacementRefreshToken);
       await _database.saveAuth(
         StoredAuth(
           userId: user.uid,
           email: user.email,
-          refreshToken: replacementRefreshToken,
+          refreshToken: _secureStore == null ? replacementRefreshToken : '',
         ),
       );
       return token;

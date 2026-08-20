@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import '../../data/activity_repository.dart';
 import '../../data/session_repository.dart';
 import '../../domain/models.dart';
 
@@ -9,10 +10,20 @@ class DashboardScreen extends StatefulWidget {
     super.key,
     required this.userId,
     required this.sessions,
+    this.activities,
+    this.categories,
+    this.insights,
+    this.onGenerateInsight,
+    this.onExcludeApp,
   });
 
   final String userId;
   final SessionRepository sessions;
+  final ActivityRepository? activities;
+  final CategoryRepository? categories;
+  final InsightRepository? insights;
+  final Future<void> Function(DateTime day)? onGenerateInsight;
+  final Future<void> Function(String appId)? onExcludeApp;
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -20,68 +31,61 @@ class DashboardScreen extends StatefulWidget {
 
 class _DashboardScreenState extends State<DashboardScreen> {
   DateTime _day = DateTime.now();
+  bool _generatingInsight = false;
+  int _insightRevision = 0;
 
   @override
   Widget build(BuildContext context) {
     return SafeArea(
       child: Padding(
-        padding: const EdgeInsets.all(40),
+        padding: const EdgeInsets.fromLTRB(32, 28, 32, 24),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Your day',
-                        style: Theme.of(context).textTheme.headlineMedium,
-                      ),
-                      const SizedBox(height: 6),
-                      Text('See where focused work and recovery time went.'),
-                    ],
-                  ),
-                ),
-                IconButton(
-                  tooltip: 'Previous day',
-                  onPressed: () => setState(
-                    () => _day = _day.subtract(const Duration(days: 1)),
-                  ),
-                  icon: const Icon(Icons.chevron_left),
-                ),
-                TextButton(
-                  onPressed: () => setState(() => _day = DateTime.now()),
-                  child: Text(_dayLabel),
-                ),
-                IconButton(
-                  tooltip: 'Next day',
-                  onPressed: _isToday
-                      ? null
-                      : () => setState(
-                          () => _day = _day.add(const Duration(days: 1)),
-                        ),
-                  icon: const Icon(Icons.chevron_right),
-                ),
-                IconButton(
-                  tooltip: 'Sync now',
-                  onPressed: () => widget.sessions.sync(widget.userId),
-                  icon: const Icon(Icons.sync),
-                ),
-              ],
-            ),
-            const SizedBox(height: 28),
+            _header(context),
+            const SizedBox(height: 22),
             Expanded(
               child: StreamBuilder<List<WorkSession>>(
                 stream: widget.sessions.watchDay(widget.userId, _day),
-                builder: (context, snapshot) {
-                  if (!snapshot.hasData) {
+                builder: (context, sessionSnapshot) {
+                  if (!sessionSnapshot.hasData) {
                     return const Center(child: CircularProgressIndicator());
                   }
-                  final sessions = snapshot.data!;
-                  if (sessions.isEmpty) return _empty(context);
-                  return _content(context, sessions);
+                  final activityRepository = widget.activities;
+                  if (activityRepository == null) {
+                    return _content(
+                      context,
+                      sessionSnapshot.data!,
+                      const [],
+                      const [],
+                    );
+                  }
+                  return StreamBuilder<List<ActivityBlock>>(
+                    stream: activityRepository.watchDay(widget.userId, _day),
+                    builder: (context, activitySnapshot) {
+                      final categoryRepository = widget.categories;
+                      if (!activitySnapshot.hasData ||
+                          categoryRepository == null) {
+                        return const Center(child: CircularProgressIndicator());
+                      }
+                      return StreamBuilder<List<ActivityCategory>>(
+                        stream: categoryRepository.watch(widget.userId),
+                        builder: (context, categorySnapshot) {
+                          if (!categorySnapshot.hasData) {
+                            return const Center(
+                              child: CircularProgressIndicator(),
+                            );
+                          }
+                          return _content(
+                            context,
+                            sessionSnapshot.data!,
+                            activitySnapshot.data!,
+                            categorySnapshot.data!,
+                          );
+                        },
+                      );
+                    },
+                  );
                 },
               ),
             ),
@@ -91,13 +95,62 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget _content(BuildContext context, List<WorkSession> sessions) {
+  Widget _header(BuildContext context) {
+    return Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Your day',
+                style: Theme.of(context).textTheme.headlineMedium,
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Observed activity is the source of category totals. Pomodoros '
+                'appear as a separate intention lane.',
+              ),
+            ],
+          ),
+        ),
+        IconButton(
+          tooltip: 'Previous day',
+          onPressed: () =>
+              setState(() => _day = _day.subtract(const Duration(days: 1))),
+          icon: const Icon(Icons.chevron_left),
+        ),
+        TextButton(
+          onPressed: () => setState(() => _day = DateTime.now()),
+          child: Text(_dayLabel),
+        ),
+        IconButton(
+          tooltip: 'Next day',
+          onPressed: _isToday
+              ? null
+              : () => setState(() => _day = _day.add(const Duration(days: 1))),
+          icon: const Icon(Icons.chevron_right),
+        ),
+      ],
+    );
+  }
+
+  Widget _content(
+    BuildContext context,
+    List<WorkSession> sessions,
+    List<ActivityBlock> blocks,
+    List<ActivityCategory> categories,
+  ) {
+    final observedSeconds = blocks.fold<int>(
+      0,
+      (sum, block) => sum + block.durationSeconds,
+    );
     final focusSeconds = sessions
         .where((session) => session.phase == TimerPhase.focus)
         .fold<int>(0, (sum, session) => sum + _secondsInDay(session));
-    final breakSeconds = sessions
-        .where((session) => session.phase.isBreak)
-        .fold<int>(0, (sum, session) => sum + _secondsInDay(session));
+    final classifiedSeconds = blocks
+        .where((block) => block.categoryId != null)
+        .fold<int>(0, (sum, block) => sum + block.durationSeconds);
     final completed = sessions
         .where(
           (session) =>
@@ -105,67 +158,74 @@ class _DashboardScreenState extends State<DashboardScreen> {
               session.outcome == SessionOutcome.completed,
         )
         .length;
-    final partialSeconds = sessions
-        .where(
-          (session) =>
-              session.phase == TimerPhase.focus &&
-              session.outcome == SessionOutcome.stopped,
-        )
-        .fold<int>(0, (sum, session) => sum + _secondsInDay(session));
 
-    return Column(
+    if (sessions.isEmpty && blocks.isEmpty) return _empty(context);
+    return ListView(
       children: [
-        Row(
+        Wrap(
+          spacing: 12,
+          runSpacing: 12,
           children: [
-            Expanded(
-              child: _stat(
-                context,
-                'Focus',
-                _friendlyDuration(focusSeconds),
-                Icons.bolt,
-              ),
+            _stat(
+              context,
+              'Observed',
+              _friendlyDuration(observedSeconds),
+              Icons.visibility_outlined,
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _stat(
-                context,
-                'Breaks',
-                _friendlyDuration(breakSeconds),
-                Icons.coffee_outlined,
-              ),
+            _stat(
+              context,
+              'Pomodoro focus',
+              _friendlyDuration(focusSeconds),
+              Icons.bolt,
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _stat(
-                context,
-                'Pomodoros',
-                '$completed',
-                Icons.check_circle_outline,
-              ),
+            _stat(
+              context,
+              'Categorized',
+              observedSeconds == 0
+                  ? '—'
+                  : '${(classifiedSeconds * 100 / observedSeconds).round()}%',
+              Icons.sell_outlined,
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _stat(
-                context,
-                'Partial focus',
-                _friendlyDuration(partialSeconds),
-                Icons.timelapse,
-              ),
+            _stat(
+              context,
+              'Pomodoros',
+              '$completed',
+              Icons.check_circle_outline,
             ),
           ],
         ),
-        const SizedBox(height: 24),
-        Expanded(
-          child: Card(
-            color: Theme.of(context).colorScheme.surfaceContainerLow,
-            child: ListView.separated(
-              padding: const EdgeInsets.all(14),
-              itemCount: sessions.length,
-              separatorBuilder: (_, _) => const Divider(height: 1),
-              itemBuilder: (context, index) =>
-                  _sessionTile(context, sessions[index]),
-            ),
-          ),
+        if (blocks.isNotEmpty) ...[
+          const SizedBox(height: 18),
+          _categorySummary(context, blocks, categories, observedSeconds),
+        ],
+        if (widget.insights != null) ...[
+          const SizedBox(height: 18),
+          _insightCard(context),
+        ],
+        const SizedBox(height: 18),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final activity = _activityTimeline(context, blocks, categories);
+            final pomodoro = _pomodoroTimeline(context, sessions);
+            if (constraints.maxWidth >= 980 && blocks.isNotEmpty) {
+              return Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(flex: 6, child: activity),
+                  const SizedBox(width: 16),
+                  Expanded(flex: 5, child: pomodoro),
+                ],
+              );
+            }
+            return Column(
+              children: [
+                if (blocks.isNotEmpty) activity,
+                if (blocks.isNotEmpty && sessions.isNotEmpty)
+                  const SizedBox(height: 16),
+                pomodoro,
+              ],
+            );
+          },
         ),
       ],
     );
@@ -177,23 +237,204 @@ class _DashboardScreenState extends State<DashboardScreen> {
     String value,
     IconData icon,
   ) {
+    return SizedBox(
+      width: 210,
+      child: Card(
+        color: Theme.of(context).colorScheme.surfaceContainerLow,
+        child: Padding(
+          padding: const EdgeInsets.all(18),
+          child: Row(
+            children: [
+              Icon(icon, color: Theme.of(context).colorScheme.primary),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(value, style: Theme.of(context).textTheme.titleLarge),
+                    Text(label, style: Theme.of(context).textTheme.bodySmall),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _categorySummary(
+    BuildContext context,
+    List<ActivityBlock> blocks,
+    List<ActivityCategory> categories,
+    int total,
+  ) {
+    final byId = {for (final category in categories) category.id: category};
+    final totals = <String?, int>{};
+    for (final block in blocks) {
+      totals.update(
+        block.categoryId,
+        (value) => value + block.durationSeconds,
+        ifAbsent: () => block.durationSeconds,
+      );
+    }
+    final entries = totals.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    return Card(
+      color: Theme.of(context).colorScheme.surfaceContainerLow,
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Observed categories',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+            const SizedBox(height: 16),
+            for (final entry in entries) ...[
+              Builder(
+                builder: (context) {
+                  final category = byId[entry.key];
+                  final color = Color(category?.colorValue ?? 0xff94a3b8);
+                  final fraction = total == 0 ? 0.0 : entry.value / total;
+                  return Row(
+                    children: [
+                      SizedBox(
+                        width: 130,
+                        child: Text(category?.name ?? 'Needs review'),
+                      ),
+                      Expanded(
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(20),
+                          child: LinearProgressIndicator(
+                            minHeight: 9,
+                            value: fraction,
+                            color: color,
+                            backgroundColor: color.withValues(alpha: 0.14),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      SizedBox(
+                        width: 72,
+                        child: Text(
+                          _friendlyDuration(entry.value),
+                          textAlign: TextAlign.end,
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+              const SizedBox(height: 10),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _activityTimeline(
+    BuildContext context,
+    List<ActivityBlock> blocks,
+    List<ActivityCategory> categories,
+  ) {
+    final byId = {for (final category in categories) category.id: category};
+    return _timelineCard(
+      context,
+      title: 'Observed activity',
+      subtitle: 'Screenshots are never kept',
+      emptyMessage: 'No activity observations for this day.',
+      children: [
+        for (final block in blocks)
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: CircleAvatar(
+              backgroundColor: Color(
+                byId[block.categoryId]?.colorValue ?? 0xff94a3b8,
+              ).withValues(alpha: 0.15),
+              child: Icon(
+                Icons.desktop_windows_outlined,
+                color: Color(byId[block.categoryId]?.colorValue ?? 0xff64748b),
+              ),
+            ),
+            title: Text(block.activityLabel),
+            subtitle: Text(
+              '${block.appName} · ${byId[block.categoryId]?.name ?? 'Needs review'} · '
+              '${block.confidence < 0.60 ? 'Low confidence—review · ' : ''}'
+              '${_timeRange(block.startedAt, block.endedAt)} · '
+              '${_friendlyDuration(block.durationSeconds)}',
+            ),
+            trailing: widget.activities == null
+                ? null
+                : PopupMenuButton<String>(
+                    tooltip: 'Change category',
+                    onSelected: (value) {
+                      if (value == '_exclude') {
+                        widget.onExcludeApp?.call(block.appId);
+                      } else {
+                        widget.activities!.setBlockCategory(block, value);
+                      }
+                    },
+                    itemBuilder: (context) => [
+                      for (final category in categories.where(
+                        (value) => !value.isArchived,
+                      ))
+                        PopupMenuItem(
+                          value: category.id,
+                          child: Text(category.name),
+                        ),
+                      if (widget.onExcludeApp != null) ...[
+                        const PopupMenuDivider(),
+                        const PopupMenuItem(
+                          value: '_exclude',
+                          child: Text('Exclude this app'),
+                        ),
+                      ],
+                    ],
+                  ),
+          ),
+      ],
+    );
+  }
+
+  Widget _pomodoroTimeline(BuildContext context, List<WorkSession> sessions) {
+    return _timelineCard(
+      context,
+      title: 'Pomodoro intention',
+      subtitle: 'Kept separate to avoid double-counting',
+      emptyMessage: 'No Pomodoro sessions for this day.',
+      children: [
+        for (final session in sessions) _sessionTile(context, session),
+      ],
+    );
+  }
+
+  Widget _timelineCard(
+    BuildContext context, {
+    required String title,
+    required String subtitle,
+    required String emptyMessage,
+    required List<Widget> children,
+  }) {
     return Card(
       color: Theme.of(context).colorScheme.surfaceContainerLow,
       child: Padding(
         padding: const EdgeInsets.all(18),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Icon(icon, color: Theme.of(context).colorScheme.primary),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(value, style: Theme.of(context).textTheme.titleLarge),
-                  Text(label, style: Theme.of(context).textTheme.bodySmall),
-                ],
-              ),
-            ),
+            Text(title, style: Theme.of(context).textTheme.titleLarge),
+            Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
+            const SizedBox(height: 10),
+            if (children.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 20),
+                child: Text(emptyMessage),
+              )
+            else
+              ...children,
           ],
         ),
       ),
@@ -201,9 +442,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Widget _sessionTile(BuildContext context, WorkSession session) {
-    final localStart = session.startedAt.toLocal();
-    final localEnd = session.endedAt.toLocal();
     return ListTile(
+      contentPadding: EdgeInsets.zero,
       leading: CircleAvatar(
         child: Icon(
           session.phase == TimerPhase.focus
@@ -217,10 +457,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
             : session.phase.label,
       ),
       subtitle: Text(
-        '${DateFormat.jm().format(localStart)}–${DateFormat.jm().format(localEnd)} · '
+        '${_timeRange(session.startedAt, session.endedAt)} · '
         '${_friendlyDuration(_secondsInDay(session))}'
-        '${session.outcome == SessionOutcome.stopped ? ' · partial' : ''}'
-        '${session.phase.isBreak && session.activity.isNotEmpty ? ' · ${session.activity}' : ''}',
+        '${session.outcome == SessionOutcome.stopped ? ' · partial' : ''}',
       ),
       trailing: PopupMenuButton<String>(
         onSelected: (value) {
@@ -233,6 +472,79 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ],
       ),
     );
+  }
+
+  Widget _insightCard(BuildContext context) {
+    final repository = widget.insights!;
+    return FutureBuilder<DailyInsight?>(
+      key: ValueKey('${_day.toIso8601String()}:$_insightRevision'),
+      future: repository.get(widget.userId, _day),
+      builder: (context, snapshot) {
+        final insight = snapshot.data;
+        return Card(
+          color: Theme.of(context).colorScheme.primaryContainer,
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Icon(Icons.auto_awesome_outlined),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Local daily insight',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 6),
+                      Text(
+                        insight?.summary ??
+                            'Generate a private summary from today’s local '
+                                'activity and Pomodoro records.',
+                      ),
+                      if (insight != null) ...[
+                        for (final pattern in insight.patterns.take(3))
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Text('• $pattern'),
+                          ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (widget.onGenerateInsight != null)
+                  TextButton(
+                    onPressed: _generatingInsight ? null : _generateInsight,
+                    child: Text(insight == null ? 'Generate' : 'Refresh'),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _generateInsight() async {
+    setState(() => _generatingInsight = true);
+    try {
+      await widget.onGenerateInsight!(_day);
+      if (mounted) setState(() => _insightRevision++);
+    } on Object {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Could not generate a local insight. Check the model status in Settings.',
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _generatingInsight = false);
+    }
   }
 
   Widget _empty(BuildContext context) {
@@ -251,7 +563,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             style: Theme.of(context).textTheme.titleLarge,
           ),
           const SizedBox(height: 6),
-          const Text('Completed and partial sessions will appear here.'),
+          const Text('Activity observations and Pomodoros will appear here.'),
         ],
       ),
     );
@@ -292,7 +604,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
       builder: (context) => AlertDialog(
         title: const Text('Delete this interval?'),
         content: const Text(
-          'It will be removed locally and from Firebase during synchronization.',
+          'It will be removed from this computer. No activity data is stored '
+          'in Firebase.',
         ),
         actions: [
           TextButton(
@@ -324,6 +637,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final overlapMs = overlapEnd.difference(overlapStart).inMilliseconds;
     return (session.actualSeconds * overlapMs / spanMs).round();
   }
+
+  String _timeRange(DateTime start, DateTime end) =>
+      '${DateFormat.jm().format(start.toLocal())}–'
+      '${DateFormat.jm().format(end.toLocal())}';
 
   String _friendlyDuration(int seconds) {
     if (seconds < 60) return '${seconds}s';

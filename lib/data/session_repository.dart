@@ -1,14 +1,10 @@
-import 'dart:async';
-
 import '../domain/models.dart';
 import 'local/app_database.dart';
-import 'sync_service.dart';
 
 class SessionRepository {
-  SessionRepository(this._database, [this._syncService]);
+  SessionRepository(this._database);
 
   final AppDatabase _database;
-  final SyncService? _syncService;
 
   Stream<List<WorkSession>> watchDay(String userId, DateTime localDay) {
     final start = DateTime(localDay.year, localDay.month, localDay.day);
@@ -17,8 +13,7 @@ class SessionRepository {
   }
 
   Future<void> save(WorkSession session) async {
-    await _database.upsertSession(session.copyWith(isDirty: true));
-    unawaited(sync(session.userId));
+    await _database.upsertSession(session.copyWith(isDirty: false));
   }
 
   Future<void> editActivity(WorkSession session, String activity) async {
@@ -28,57 +23,41 @@ class SessionRepository {
       session.copyWith(
         activity: value,
         updatedAt: DateTime.now().toUtc(),
-        isDirty: true,
+        isDirty: false,
       ),
     );
-    unawaited(sync(session.userId));
   }
 
-  Future<void> delete(WorkSession session) async {
-    await _database.upsertSession(
-      session.copyWith(
-        isDeleted: true,
-        updatedAt: DateTime.now().toUtc(),
-        isDirty: true,
-      ),
-    );
-    unawaited(sync(session.userId));
-  }
+  Future<void> setCategory(
+    WorkSession session,
+    String categoryId, {
+    ActivityCategorySource source = ActivityCategorySource.manual,
+  }) => _database.upsertSession(
+    session.copyWith(
+      categoryId: categoryId,
+      categorySource: source,
+      categoryConfidence: source == ActivityCategorySource.manual ? 1 : null,
+      updatedAt: DateTime.now().toUtc(),
+      isDirty: false,
+    ),
+  );
 
-  Future<void> sync(String userId) async {
-    final syncService = _syncService;
-    if (syncService == null) return;
-    try {
-      await syncService.syncUser(userId);
-    } on Object {
-      // Local data remains authoritative and dirty records retry later.
-    }
-  }
+  Future<void> delete(WorkSession session) =>
+      _database.hardDeleteSession(session.id);
+
+  Future<List<WorkSession>> all(String userId) => _database.allSessions(userId);
 }
 
 class SettingsRepository {
-  SettingsRepository(this._database, [this._syncService]);
+  SettingsRepository(this._database);
 
   final AppDatabase _database;
-  final SyncService? _syncService;
 
   Stream<PomodoroSettings> watch(String userId) =>
       _database.watchSettings(userId);
 
   Future<PomodoroSettings> get(String userId) => _database.settings(userId);
 
-  Future<void> save(String userId, PomodoroSettings settings) async {
-    await _database.saveSettings(userId, settings, markDirty: true);
-    unawaited(sync(userId));
-  }
-
-  Future<void> sync(String userId) async {
-    final syncService = _syncService;
-    if (syncService == null) return;
-    try {
-      await syncService.syncUser(userId);
-    } on Object {
-      // Settings will synchronize on the next successful sync.
-    }
-  }
+  Future<void> save(String userId, PomodoroSettings settings) =>
+      _database.saveSettings(userId, settings, markDirty: false);
 }

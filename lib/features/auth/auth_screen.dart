@@ -84,8 +84,23 @@ class _AuthScreenState extends State<AuthScreen> {
                   ),
                   const SizedBox(height: 12),
                   Text(
-                    'A quiet record of where your focused time goes.',
+                    'Private, local activity intelligence for your working day.',
                     style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  const SizedBox(height: 24),
+                  const _AuthPrivacyPoint(
+                    icon: Icons.lock_outline,
+                    text: 'Activity history is encrypted on this computer.',
+                  ),
+                  const SizedBox(height: 12),
+                  const _AuthPrivacyPoint(
+                    icon: Icons.cloud_off_outlined,
+                    text: 'Firebase is used only for account authentication.',
+                  ),
+                  const SizedBox(height: 12),
+                  const _AuthPrivacyPoint(
+                    icon: Icons.memory_outlined,
+                    text: 'Gemma analyzes activity locally—never in the cloud.',
                   ),
                 ],
               ),
@@ -172,6 +187,24 @@ class _AuthScreenState extends State<AuthScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _AuthPrivacyPoint extends StatelessWidget {
+  const _AuthPrivacyPoint({required this.icon, required this.text});
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Icon(icon, size: 20, color: Theme.of(context).colorScheme.primary),
+        const SizedBox(width: 10),
+        Expanded(child: Text(text)),
+      ],
     );
   }
 }

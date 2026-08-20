@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:my_pomodoro_time_management_system/data/local/app_database.dart';
 import 'package:my_pomodoro_time_management_system/services/auth_service.dart';
+import 'package:my_pomodoro_time_management_system/services/secure_store.dart';
 
 void main() {
   test(
@@ -94,4 +95,55 @@ void main() {
       );
     },
   );
+
+  test(
+    'production-style secure store keeps refresh token out of SQLite',
+    () async {
+      final database = AppDatabase(NativeDatabase.memory());
+      addTearDown(database.close);
+      final secureStore = _MemorySecureStore();
+      final auth = await AuthService.create(
+        database: database,
+        apiKey: 'test-key',
+        secureStore: secureStore,
+        client: MockClient(
+          (_) async => http.Response(
+            jsonEncode({
+              'localId': 'secure-user',
+              'email': 'secure@example.com',
+              'idToken': 'short-lived-id-token',
+              'refreshToken': 'long-lived-secret',
+              'expiresIn': '3600',
+            }),
+            200,
+          ),
+        ),
+      );
+
+      await auth.signIn('secure@example.com', 'password');
+
+      expect((await database.storedAuth())?.refreshToken, isEmpty);
+      expect(
+        await secureStore.refreshToken('secure-user'),
+        'long-lived-secret',
+      );
+    },
+  );
+}
+
+class _MemorySecureStore extends SecureStore {
+  final Map<String, String> _tokens = {};
+
+  @override
+  Future<String?> refreshToken(String userId) async => _tokens[userId];
+
+  @override
+  Future<void> saveRefreshToken(String userId, String token) async {
+    _tokens[userId] = token;
+  }
+
+  @override
+  Future<void> deleteRefreshToken(String userId) async {
+    _tokens.remove(userId);
+  }
 }

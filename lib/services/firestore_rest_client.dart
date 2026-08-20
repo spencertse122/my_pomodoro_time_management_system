@@ -25,17 +25,6 @@ class FirestoreRestClient {
   final AuthService _auth;
   final http.Client _client;
 
-  Future<void> setDocument(
-    String documentPath,
-    Map<String, Object?> fields,
-  ) async {
-    await _request(
-      'PATCH',
-      _documentUri(documentPath),
-      body: {'fields': _encodeFields(fields)},
-    );
-  }
-
   Future<FirestoreDocument?> getDocument(String documentPath) async {
     final response = await _request(
       'GET',
@@ -44,6 +33,10 @@ class FirestoreRestClient {
     );
     if (response == null) return null;
     return _decodeDocument(response);
+  }
+
+  Future<void> deleteDocument(String documentPath) async {
+    await _request('DELETE', _documentUri(documentPath), allowNotFound: true);
   }
 
   Future<List<FirestoreDocument>> listDocuments(String collectionPath) async {
@@ -75,27 +68,22 @@ class FirestoreRestClient {
   Future<Map<String, dynamic>?> _request(
     String method,
     Uri uri, {
-    Map<String, Object?>? body,
     bool allowNotFound = false,
     bool retryAuthentication = true,
   }) async {
     try {
       final token = await _auth.idToken(forceRefresh: !retryAuthentication);
-      final headers = <String, String>{
-        'Authorization': 'Bearer $token',
-        if (body != null) 'Content-Type': 'application/json',
-      };
+      final headers = <String, String>{'Authorization': 'Bearer $token'};
       final response = await switch (method) {
         'GET' => _client.get(uri, headers: headers),
-        'PATCH' => _client.patch(uri, headers: headers, body: jsonEncode(body)),
+        'DELETE' => _client.delete(uri, headers: headers),
         _ => throw ArgumentError.value(method, 'method'),
       }.timeout(const Duration(seconds: 20));
 
       if (response.statusCode == 401 && retryAuthentication) {
-        return _request(
+        return await _request(
           method,
           uri,
-          body: body,
           allowNotFound: allowNotFound,
           retryAuthentication: false,
         );
@@ -114,11 +102,11 @@ class FirestoreRestClient {
       );
     } on TimeoutException {
       throw const FirestoreException(
-        'Firestore did not respond. Local changes will retry later.',
+        'Firestore did not respond. The one-time migration was not completed.',
       );
     } on http.ClientException {
       throw const FirestoreException(
-        'Could not reach Firestore. Local changes will retry later.',
+        'Could not reach Firestore. The one-time migration was not completed.',
       );
     }
   }
@@ -136,32 +124,6 @@ class FirestoreRestClient {
     for (final entry in fields.entries)
       entry.key: _decodeValue(entry.value as Map<String, dynamic>),
   };
-
-  Map<String, dynamic> _encodeFields(Map<String, Object?> fields) => {
-    for (final entry in fields.entries) entry.key: _encodeValue(entry.value),
-  };
-
-  Map<String, dynamic> _encodeValue(Object? value) {
-    if (value == null) return const {'nullValue': null};
-    if (value is bool) return {'booleanValue': value};
-    if (value is int) return {'integerValue': value.toString()};
-    if (value is double) return {'doubleValue': value};
-    if (value is DateTime) {
-      return {'timestampValue': value.toUtc().toIso8601String()};
-    }
-    if (value is String) return {'stringValue': value};
-    if (value is List<Object?>) {
-      return {
-        'arrayValue': {'values': value.map(_encodeValue).toList()},
-      };
-    }
-    if (value is Map<String, Object?>) {
-      return {
-        'mapValue': {'fields': _encodeFields(value)},
-      };
-    }
-    throw ArgumentError.value(value, 'value', 'Unsupported Firestore value');
-  }
 
   dynamic _decodeValue(Map<String, dynamic> value) {
     if (value.containsKey('nullValue')) return null;
