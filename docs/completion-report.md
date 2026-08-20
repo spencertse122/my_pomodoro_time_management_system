@@ -43,11 +43,6 @@ user isolation.
 
 ## Not verifiable in this environment
 
-- Publishing `feat/privacy-first-v2` and observing its hosted CI are blocked by
-  repository authorization: the available GitHub identity
-  `afreeelfdobby934-sys` has read-only access to
-  `spencertse122/my_pomodoro_time_management_system`. The complete branch and
-  commits remain available in the local repository.
 - Native macOS and Windows compilation and physical permission flows. The
   current host is Linux and the project intentionally has no Linux target.
 - Real Gemma image inference, latency, and memory/thermal behavior. Licensed

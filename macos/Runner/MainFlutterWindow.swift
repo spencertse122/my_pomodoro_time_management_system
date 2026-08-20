@@ -214,9 +214,12 @@ class MainFlutterWindow: NSWindow {
 
   @available(macOS 13.0, *)
   private func activitySnapshot() -> [String: Any] {
+    // kCGAnyInputEventType is a C macro rather than a CGEventType case, so it
+    // must be represented by its documented all-bits-set token in Swift.
+    let anyInputEvent = CGEventType(rawValue: UInt32.max)!
     let idleSeconds = CGEventSource.secondsSinceLastEventType(
       .combinedSessionState,
-      eventType: .anyInputEvent
+      eventType: anyInputEvent
     )
     let safeIdleSeconds = idleSeconds.isFinite ? max(0, idleSeconds) : 0
     let isLocked = screenIsLocked()
@@ -328,7 +331,7 @@ class MainFlutterWindow: NSWindow {
       (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
         as? NSNumber)?.uint32Value == displayId
     }
-    return screen?.backingScaleFactor ?? 1.0
+    return Double(screen?.backingScaleFactor ?? 1.0)
   }
 }
 
